@@ -202,7 +202,7 @@ deliberately; the CLI exposes ``--max-cells``. The limit is checked before any
 expensive work, and in the CLI before the road network is built;
 `surface.check_grid_size` makes the same check on its own.
 
-## Current scope: v0.4.3
+## Current scope: v0.1.0
 
 Supported:
 
@@ -376,3 +376,7 @@ direct per-cell readings of the exact network result.
 ## References
 
 See [`REFERENCES.md`](REFERENCES.md).
+
+## License
+
+MIT.

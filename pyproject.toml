@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netvoronoi"
-version = "0.4.3"
+version = "0.1.0"
 description = "Network-distance Voronoi and additive-epsilon Voronoi regions on spatial networks"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "BSD-3-Clause"}
+license = {text = "MIT"}
 authors = [{name = "James Matthew Miraflor"}]
 dependencies = [
   "geopandas>=1.0",

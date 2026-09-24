@@ -14,4 +14,4 @@ __all__ = [
     "surface_voronoi",
 ]
 
-__version__ = "0.4.3"
+__version__ = "0.1.0"
