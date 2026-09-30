@@ -216,6 +216,53 @@ Supported: projected undirected simple line networks, geometric edge length as i
 
 Not yet supported: directed/one-way routing, turn restrictions, arbitrary travel-time impedance, polygon cells that are mathematically exact off-network, or automatic repair of uncertain road topology.
 
+## Provenance
+
+`net-voronoi` implements a published construction. It does not propose a new kind of Voronoi diagram. The object it computes is the network Voronoi diagram (Okabe et al., 2000; Okabe et al., 2008), in which every location on a network belongs to the nearest generator by shortest-path distance. Here each generator is a cluster of points.
+
+The cluster rule reduces to the ordinary diagram of the points. At every location $`x`$, the smallest $`D(c, x)`$ over all clusters equals the smallest network distance from $`x`$ to any single point, so the winning cluster is the cluster of the nearest point. The cluster cells are therefore the ordinary network Voronoi cells of the individual points, merged by cluster label. The only addition is the rule for exact ties between clusters, which is a convention (see [Ties and cluster IDs](#ties-and-cluster-ids)).
+
+### Source of each step
+
+| Step in `net-voronoi` | Published source or earlier implementation |
+|---|---|
+| Each network location belongs to the nearest generator by shortest-path distance | Network Voronoi diagram: Okabe et al. (2000), section on network Voronoi diagrams; Okabe et al. (2008). Partition of a network that includes locations inside edges: Hakimi, Labbé and Schmeichel (1992). Node-based graph version: Erwig (2000). |
+| A generator is a set of points, and the distance to it is the distance to its nearest member | Equivalent to merging the ordinary point cells by label, as shown above. Voronoi diagrams whose generators are sets rather than single points, such as areas, are a standard generalization (Okabe et al., 2000). |
+| One multi-source shortest-path search from all points | Dijkstra (1959) started from several sources at once. NetworkX `voronoi_cells` uses the same construction and cites Erwig (2000) (Hagberg et al., 2008; NetworkX documentation). Computed here with SciPy `csgraph.dijkstra` and `min_only=True` (Virtanen et al., 2020). |
+| Exact boundary inside an edge, $`x^* = (D(v) + L - D(u))/2`$ | Follows from the distance along an edge, $`\min(D(u) + x,\ D(v) + L - x)`$, which is the edge function of network location theory (Hakimi, 1964) and of the network Voronoi partition (Hakimi et al., 1992; Okabe et al., 2008). |
+| Snapped points inserted as graph nodes, splitting the edge | Points moved to the nearest road segment, with the segment split at that location (Wang et al., 2019); objects located on network edges (Yiu and Mamoulis, 2004). |
+| 2-D surface | A rendering step, not a Voronoi construction: each grid cell takes the exact network result at its nearest network location, and the result is labeled as an approximation. |
+
+### What is specific to this package
+
+**Tie-candidate search.** Section 8 of [`DESIGN.md`](DESIGN.md) finds the winners with one multi-source search, plus extra bounded searches only for clusters that could change a winner under an exact tie. No published source for this procedure was found in the provenance review of September 2026. It changes only the amount of computation, not the result: `DESIGN.md` gives the argument that no true tie can be missed, and `tests/test_core_reference.py` checks that it gives the same winners as the direct method (one full search per cluster) on random networks and on grids where ties are everywhere.
+
+The other package-specific parts are engineering and conventions: road topology from shared vertices, the local numerical tolerance, snapping diagnostics, validation of `SpatialNetwork` objects, and the output layers. None of them changes the definition of the diagram.
+
+## References
+
+Dijkstra, E. W. (1959). A note on two problems in connexion with graphs. *Numerische Mathematik*, 1, 269–271.
+
+Erwig, M. (2000). The graph Voronoi diagram with applications. *Networks*, 36(3), 156–163. https://doi.org/10.1002/1097-0037(200010)36:3%3C156::AID-NET2%3E3.0.CO;2-L
+
+Hagberg, A. A., Schult, D. A., & Swart, P. J. (2008). Exploring network structure, dynamics, and function using NetworkX. In *Proceedings of the 7th Python in Science Conference (SciPy 2008)*, 11–15.
+
+Hakimi, S. L. (1964). Optimum locations of switching centers and the absolute centers and medians of a graph. *Operations Research*, 12(3), 450–459. https://doi.org/10.1287/opre.12.3.450
+
+Hakimi, S. L., Labbé, M., & Schmeichel, E. (1992). The Voronoi partition of a network and its implications in location theory. *ORSA Journal on Computing* (now *INFORMS Journal on Computing*), 4(4), 412–417.
+
+NetworkX documentation. *Voronoi cells*. https://networkx.org/documentation/stable/reference/algorithms/voronoi.html
+
+Okabe, A., Boots, B., Sugihara, K., & Chiu, S. N. (2000). *Spatial Tessellations: Concepts and Applications of Voronoi Diagrams* (2nd ed.). Wiley. ISBN 978-0-471-98635-5.
+
+Okabe, A., Satoh, T., Furuta, T., Suzuki, A., & Okano, K. (2008). Generalized network Voronoi diagrams: Concepts, computational methods, and applications. *International Journal of Geographical Information Science*, 22(9), 965–994.
+
+Virtanen, P., Gommers, R., Oliphant, T. E., et al. (2020). SciPy 1.0: Fundamental algorithms for scientific computing in Python. *Nature Methods*, 17, 261–272. https://doi.org/10.1038/s41592-019-0686-2
+
+Wang, T., Ren, C., Luo, Y., & Tian, J. (2019). NS-DBSCAN: A density-based clustering algorithm in network space. *ISPRS International Journal of Geo-Information*, 8(5), 218. https://doi.org/10.3390/ijgi8050218
+
+Yiu, M. L., & Mamoulis, N. (2004). Clustering objects on a spatial network. In *Proceedings of the 2004 ACM SIGMOD International Conference on Management of Data*, 443–454. https://doi.org/10.1145/1007568.1007619
+
 ## License
 
 MIT.
