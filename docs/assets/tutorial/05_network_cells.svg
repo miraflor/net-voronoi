@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" role="img" aria-labelledby="title desc">
+<title id="title">Exact cluster cells live on the line network; disconnected source-free components remain unassigned.</title>
+<desc id="desc">Exact cluster cells live on the line network; disconnected source-free components remain unassigned.</desc>
+<rect width="100%" height="100%" fill="#fff"/>
+<style>
+text{font-family:Segoe UI,Roboto,Arial,sans-serif;fill:#2d3436}
+.small{font-size:14px} .label{font-size:16px;font-weight:600} .tiny{font-size:12px;fill:#65757c}
+.road{stroke:#66757c;stroke-width:10;stroke-linecap:round;fill:none}
+.thin{stroke:#66757c;stroke-width:3;fill:none} .dash{stroke-dasharray:7 6}
+.node{stroke:#fff;stroke-width:2}
+</style>
+
+<text x="48" y="42" class="label">The exact result is a partition of network length</text>
+<!-- colored network -->
+<line x1="120" y1="275" x2="420" y2="275" stroke="#2e86de" stroke-width="14" stroke-linecap="round"/>
+<line x1="420" y1="275" x2="420" y2="70" stroke="#2e86de" stroke-width="14" stroke-linecap="round"/>
+<line x1="420" y1="275" x2="471" y2="275" stroke="#2e86de" stroke-width="14" stroke-linecap="round"/>
+<line x1="471" y1="275" x2="760" y2="275" stroke="#e67e22" stroke-width="14" stroke-linecap="round"/>
+<line x1="420" y1="275" x2="420" y2="295" stroke="#2e86de" stroke-width="14" stroke-linecap="round"/>
+<line x1="420" y1="295" x2="420" y2="455" stroke="#27ae60" stroke-width="14" stroke-linecap="round"/>
+<line x1="700" y1="90" x2="825" y2="145" stroke="#aeb9be" stroke-width="14" stroke-linecap="round"/>
+<circle cx="471" cy="275" r="6" fill="#fff" stroke="#c0392b" stroke-width="3"/>
+<circle cx="420" cy="295" r="6" fill="#fff" stroke="#c0392b" stroke-width="3"/>
+<text x="485" y="254" class="tiny">A/B boundary</text>
+<text x="435" y="322" class="tiny">A/C boundary</text>
+<circle cx="120" cy="275" r="7" fill="#2e86de" class="node"/>
+<circle cx="420" cy="132" r="7" fill="#2e86de" class="node"/>
+<circle cx="760" cy="275" r="7" fill="#e67e22" class="node"/>
+<circle cx="420" cy="455" r="7" fill="#27ae60" class="node"/>
+<rect x="70" y="400" width="760" height="74" rx="6" fill="#f7f9fa" stroke="#dfe5e8"/>
+<text x="92" y="428" class="small">network_segments: one row per exact positive-length piece</text>
+<text x="92" y="451" class="small">network_cells: pieces collected by cluster · network_unassigned: road components with no source point</text>
+
+</svg>

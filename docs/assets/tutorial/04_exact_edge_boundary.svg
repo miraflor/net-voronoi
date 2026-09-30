@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" role="img" aria-labelledby="title desc">
+<title id="title">The winner transition on a site-free edge has a closed-form boundary.</title>
+<desc id="desc">The winner transition on a site-free edge has a closed-form boundary.</desc>
+<rect width="100%" height="100%" fill="#fff"/>
+<style>
+text{font-family:Segoe UI,Roboto,Arial,sans-serif;fill:#2d3436}
+.small{font-size:14px} .label{font-size:16px;font-weight:600} .tiny{font-size:12px;fill:#65757c}
+.road{stroke:#66757c;stroke-width:10;stroke-linecap:round;fill:none}
+.thin{stroke:#66757c;stroke-width:3;fill:none} .dash{stroke-dasharray:7 6}
+.node{stroke:#fff;stroke-width:2}
+</style>
+
+<text x="48" y="42" class="label">One site-free edge can be split analytically — no densification</text>
+<text x="80" y="92" class="small">Worked edge: center u → right endpoint v, length L = 10</text>
+<line x1="130" y1="240" x2="770" y2="240" stroke="#c7d0d4" stroke-width="14" stroke-linecap="round"/>
+<!-- map units 10 => 64 px each, split 1.5 => x=226 -->
+<line x1="130" y1="240" x2="226" y2="240" stroke="#2e86de" stroke-width="14" stroke-linecap="round"/>
+<line x1="226" y1="240" x2="770" y2="240" stroke="#e67e22" stroke-width="14" stroke-linecap="round"/>
+<circle cx="130" cy="240" r="12" fill="#2e86de" class="node"/>
+<circle cx="770" cy="240" r="12" fill="#e67e22" class="node"/>
+<line x1="226" y1="200" x2="226" y2="280" stroke="#c0392b" stroke-width="3"/>
+<text x="102" y="208" class="small">u: A</text><text x="86" y="292" class="small">D(u)=7</text>
+<text x="744" y="208" class="small">v: B</text><text x="728" y="292" class="small">D(v)=0</text>
+<text x="199" y="183" class="small" fill="#c0392b">x* = 1.5</text>
+<text x="315" y="335" class="small">From u: D(u)+x = 7+x</text>
+<text x="315" y="359" class="small">From v: D(v)+L−x = 10−x</text>
+<rect x="190" y="395" width="520" height="76" rx="6" fill="#eef6fb" stroke="#b8d9ec"/>
+<text x="216" y="424" class="label">x* = (D(v) + L − D(u)) / 2 = (0 + 10 − 7) / 2 = 1.5</text>
+<text x="216" y="451" class="small">At x*=1.5, both routes have distance 8.5. A owns the left positive-length piece; B owns the right.</text>
+
+</svg>

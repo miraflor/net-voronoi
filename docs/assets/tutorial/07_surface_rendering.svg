@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="530" viewBox="0 0 900 530" role="img" aria-labelledby="title desc">
+<title id="title">The optional surface is a grid approximation to nearest-network attachment.</title>
+<desc id="desc">The optional surface is a grid approximation to nearest-network attachment.</desc>
+<rect width="100%" height="100%" fill="#fff"/>
+<style>
+text{font-family:Segoe UI,Roboto,Arial,sans-serif;fill:#2d3436}
+.small{font-size:14px} .label{font-size:16px;font-weight:600} .tiny{font-size:12px;fill:#65757c}
+.road{stroke:#66757c;stroke-width:10;stroke-linecap:round;fill:none}
+.thin{stroke:#66757c;stroke-width:3;fill:none} .dash{stroke-dasharray:7 6}
+.node{stroke:#fff;stroke-width:2}
+</style>
+
+<text x="48" y="42" class="label">Optional 2-D rendering: grid-cell representative → nearest network anchor → exact network cluster</text>
+<rect x="80" y="80" width="740" height="370" rx="8" fill="#fafcfd" stroke="#cfd9de"/>
+<!-- schematic dissolved grid regions: A upper/left, B upper/right, C lower -->
+<path d="M80 80 H490 V330 H80 Z" fill="#2e86de" opacity=".10"/>
+<path d="M490 80 H820 V330 H490 Z" fill="#e67e22" opacity=".10"/>
+<path d="M80 330 H820 V450 H80 Z" fill="#27ae60" opacity=".10"/>
+<line x1="80" y1="80" x2="80" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="154" y1="80" x2="154" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="228" y1="80" x2="228" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="302" y1="80" x2="302" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="376" y1="80" x2="376" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="450" y1="80" x2="450" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="524" y1="80" x2="524" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="598" y1="80" x2="598" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="672" y1="80" x2="672" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="746" y1="80" x2="746" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="820" y1="80" x2="820" y2="450" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="80" x2="820" y2="80" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="142" x2="820" y2="142" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="204" x2="820" y2="204" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="266" x2="820" y2="266" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="328" x2="820" y2="328" stroke="#e7ecef" stroke-width="1"/><line x1="80" y1="390" x2="820" y2="390" stroke="#e7ecef" stroke-width="1"/>
+<!-- network overlay -->
+<line x1="160" y1="270" x2="740" y2="270" stroke="#66757c" stroke-width="7" stroke-linecap="round"/>
+<line x1="420" y1="115" x2="420" y2="410" stroke="#66757c" stroke-width="7" stroke-linecap="round"/>
+<line x1="160" y1="270" x2="462" y2="270" stroke="#2e86de" stroke-width="8" stroke-linecap="round"/>
+<line x1="420" y1="115" x2="420" y2="288" stroke="#2e86de" stroke-width="8" stroke-linecap="round"/>
+<line x1="462" y1="270" x2="740" y2="270" stroke="#e67e22" stroke-width="8" stroke-linecap="round"/>
+<line x1="420" y1="288" x2="420" y2="410" stroke="#27ae60" stroke-width="8" stroke-linecap="round"/>
+<!-- representative and anchor examples -->
+<circle cx="555" cy="160" r="5" fill="#e67e22"/><line x1="555" y1="160" x2="555" y2="270" stroke="#e67e22" stroke-width="2" stroke-dasharray="5 5"/><circle cx="555" cy="270" r="5" fill="#fff" stroke="#e67e22" stroke-width="2"/>
+<circle cx="332" cy="390" r="5" fill="#27ae60"/><line x1="332" y1="390" x2="420" y2="390" stroke="#27ae60" stroke-width="2" stroke-dasharray="5 5"/><circle cx="420" cy="390" r="5" fill="#fff" stroke="#27ae60" stroke-width="2"/>
+<text x="575" y="156" class="tiny">cell representative</text>
+<text x="572" y="250" class="tiny">nearest anchor → B</text>
+<text x="202" y="421" class="tiny">representative attaches to the lower road → C</text>
+<rect x="120" y="462" width="660" height="43" rx="5" fill="#eef6fb" stroke="#b8d9ec"/>
+<text x="143" y="489" class="small">The colored land areas are an approximation controlled by resolution. The colored road partition above is the exact object.</text>
+
+</svg>

@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A visual derivation of net-voronoi: clustered source points, network shortest-path distance, exact edge boundaries, topology, tie handling and optional surface rendering.">
+  <meta name="theme-color" content="#263238">
+  <title>How net-voronoi works — net-voronoi documentation</title>
+  <link rel="stylesheet" href="assets/css/site.css">
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']]
+      },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script defer src="assets/js/site.js"></script>
+</head>
+<body>
+  <button class="mobile-menu" id="mobile-menu" aria-label="Open documentation navigation" aria-expanded="false">
+    <span></span><span></span><span></span>
+  </button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <a class="brand-name" href="./">net-voronoi</a>
+      <div class="brand-subtitle">visual algorithm guide</div>
+    </div>
+    <div class="search-wrap">
+      <label class="sr-only" for="doc-search">Search this page</label>
+      <input id="doc-search" type="search" placeholder="Search this guide" autocomplete="off">
+      <kbd>/</kbd>
+    </div>
+
+    <nav class="doc-nav" aria-label="Documentation navigation">
+      <div class="nav-section">Worked example</div>
+      <a href="#how-net-voronoi-works" data-nav-label="How net-voronoi works">How net-voronoi works</a>
+      <a href="#start-with-one-small-network" data-nav-label="Worked example clustered points">Worked example</a>
+
+      <div class="nav-section">Exact network algorithm</div>
+      <a href="#1-snap-and-insert" data-nav-label="snap points insert graph nodes topology">1. Snap and insert</a>
+      <a href="#2-cluster-distance" data-nav-label="cluster distance minimum member shortest path">2. Cluster distance</a>
+      <a href="#3-node-partition" data-nav-label="node winners shortest path partition">3. Node winners</a>
+      <a href="#4-exact-edge-boundary" data-nav-label="edge boundary exact split formula">4. Exact edge split</a>
+      <a href="#5-network-cells" data-nav-label="network segments cells unassigned">5. Network cells</a>
+      <a href="#6-ties-and-topology" data-nav-label="ties topology junction crossing snap ties">6. Ties and topology</a>
+
+      <div class="nav-section">Rendering & implementation</div>
+      <a href="#7-surface-rendering" data-nav-label="surface grid nearest network attachment approximate">7. 2-D surface</a>
+      <a href="#8-fast-node-winners" data-nav-label="optimization candidate search tie candidates dijkstra">8. Fast node winners</a>
+      <a href="#from-math-to-the-package" data-nav-label="Python API package pipeline">Package pipeline</a>
+      <a href="#standard-vs-net-voronoi" data-nav-label="standard graph network Voronoi comparison">Standard vs net-voronoi</a>
+
+      <div class="nav-section">Project</div>
+      <a href="#scope-and-interpretation" data-nav-label="scope interpretation exact approximate">Scope</a>
+      <a href="#references" data-nav-label="references network Voronoi">References</a>
+      <a href="https://github.com/miraflor/net-voronoi">GitHub repository ↗</a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <span>v0.2.0</span>
+      <a href="https://github.com/miraflor/net-voronoi">View source</a>
+    </div>
+  </aside>
+
+  <div class="sidebar-scrim" id="sidebar-scrim"></div>
+
+  <main class="content-shell">
+    <article class="doc-content" id="doc-content">
+
+<h1 id="how-net-voronoi-works">How <code>net-voronoi</code> works</h1>
+
+<p class="lede"><code>net-voronoi</code> partitions a spatial network among <strong>pre-existing point clusters</strong>.
+A network location belongs to the cluster whose nearest member point is closest by shortest-path
+distance along the network. The cluster is never replaced by a centroid or medoid.</p>
+
+<div class="admonition">
+  <strong>The exact object is the line network.</strong>
+  <code>network_segments</code> and <code>network_cells</code> are the analytical Voronoi result.
+  The optional polygon surface is a separate grid approximation built by attaching each grid-cell
+  representative point to its nearest network location.
+</div>
+
+<h2 id="start-with-one-small-network">Start with one small network</h2>
+
+<p>We will use the same synthetic network throughout the derivation. Cluster A has two source points,
+while clusters B and C have one each. One point of A snaps to the interior of a road, so that location
+must become a true graph node. A small disconnected road component has no source point.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/01_input_and_snapping.svg" alt="Clustered raw points snapping to a branched line network, with one point inserted into a road interior and one disconnected road component.">
+  <figcaption>Figure 1. Points move to the network; the road topology is not changed to fit the points. An interior snapped position becomes a graph node.</figcaption>
+</figure>
+
+<div class="legend">
+  <span><i class="swatch" style="background:#2e86de"></i>cluster A</span>
+  <span><i class="swatch" style="background:#e67e22"></i>cluster B</span>
+  <span><i class="swatch" style="background:#27ae60"></i>cluster C</span>
+  <span><i class="swatch" style="background:#aeb9be"></i>unassigned network</span>
+</div>
+
+<div class="stage-list">
+<strong>The worked sequence</strong>
+<ol>
+  <li>Snap every source point and insert each interior snapped position as a graph node.</li>
+  <li>For each cluster, define distance as the shortest path to its nearest member point.</li>
+  <li>Determine the nearest cluster and nearest-cluster distance at graph nodes.</li>
+  <li>Use one closed-form formula to place every winner transition inside a site-free edge.</li>
+  <li>Collect the exact line pieces into cluster cells; source-free components stay unassigned.</li>
+  <li>Optionally render a 2-D approximation through nearest-network attachment.</li>
+</ol>
+</div>
+
+<h2 id="1-snap-and-insert">1. Snap points and make them part of the graph</h2>
+
+<p>The edge formula used later assumes that an edge has no source point in its interior. Therefore a
+point cannot remain merely as metadata on a road segment. If its nearest network location lies inside
+a segment, <code>net-voronoi</code> splits that segment at the snapped position and makes the position
+a graph node.</p>
+
+<div class="equation">
+\[
+\text{raw point}
+\;\longrightarrow\;
+\text{nearest network location}
+\;\longrightarrow\;
+\text{graph node}.
+\]
+</div>
+
+<p>This operation moves points to the road but does not invent road connectivity. A geometric crossing
+of two road lines is not a junction unless the input lines actually share a vertex there. Every
+positive-length input segment is retained.</p>
+
+<p><code>max_snap_distance</code> constrains the distance from the raw point to its nearest road
+location. The final snapped node can differ from that location by the package's tiny numerical
+segment tolerance when a point is merged with an existing vertex or an already inserted point.</p>
+
+<h2 id="2-cluster-distance">2. A cluster is a set of source points, not a center</h2>
+
+<p>Let \(P_c\) be the snapped source points carrying cluster label \(c\), and let
+\(d_N(p,x)\) be shortest-path distance along the network from source point \(p\) to a network
+location \(x\). The distance from cluster \(c\) to \(x\) is</p>
+
+<div class="equation">
+\[
+D_c(x)
+=
+\min_{p\in P_c} d_N(p,x).
+\]
+</div>
+
+<p>The nearest-cluster distance is</p>
+
+<div class="equation">
+\[
+D(x)=\min_c D_c(x),
+\]
+</div>
+
+<p>and the winner is the cluster attaining that minimum. Thus a cluster with several points has a
+multi-source shortest-path field. Its different points may control different parts of the network.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/02_cluster_distance.svg" alt="Network paths from a central junction to two points of cluster A and one point each of clusters B and C.">
+  <figcaption>Figure 2. At the center, A is 8 units away through A₁ and 7 through A₂, so \(D_A=7\). B is 10 away and C is 9 away. The winner is A.</figcaption>
+</figure>
+
+<div class="admonition">
+  <strong>Why this matters.</strong>
+  Replacing a cluster by a centroid or medoid would define a different geometry. The package keeps
+  every member point as a source and uses the nearest one at each network location.
+</div>
+
+<h2 id="3-node-partition">3. Find the winner at graph nodes</h2>
+
+<p>Conceptually, run a multi-source shortest-path search for every cluster. For graph node \(v\),</p>
+
+<div class="equation">
+\[
+D_c(v)=\min_{s\in S_c} d_N(s,v),
+\qquad
+D(v)=\min_c D_c(v),
+\]
+</div>
+
+<p>where \(S_c\) is the set of source nodes of cluster \(c\). The node winner is the cluster whose
+distance equals \(D(v)\). If several clusters are numerically tied, the lexicographically smallest
+string cluster ID wins.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/03_node_winners.svg" alt="Worked network with every graph node labelled by nearest cluster and distance, plus a disconnected source-free component.">
+  <figcaption>Figure 3. Reachable nodes receive a winner and nearest-cluster distance. A disconnected component containing no source point has infinite distance and no winner.</figcaption>
+</figure>
+
+<p>The implementation normally obtains these same node winners with fewer searches; section 8 explains
+that optimization. The conceptual definition above is the reference against which the optimized
+solver is tested.</p>
+
+<h2 id="4-exact-edge-boundary">4. Split each site-free edge exactly</h2>
+
+<p>Now take a site-free edge \(e=(u,v)\) of length \(L\), and measure a position \(x\) from endpoint
+\(u\). Any shortest route from an interior point of this edge to a source must leave the edge through
+\(u\) or \(v\). Therefore the nearest-cluster distance along the edge is</p>
+
+<div class="equation">
+\[
+D(x)
+=
+\min\!\left(D(u)+x,\;D(v)+L-x\right).
+\]
+</div>
+
+<p>If the deterministic winners at \(u\) and \(v\) are the same cluster, that cluster owns the whole
+positive-length edge. If the endpoint winners differ, the two endpoint expressions meet once:</p>
+
+<div class="equation">
+\[
+x^*
+=
+\frac{D(v)+L-D(u)}{2}.
+\]
+</div>
+
+<p>The \(u\)-side winner owns the edge up to \(x^*\), and the \(v\)-side winner owns the remainder.
+The boundary is clipped to \([0,L]\); if it is within numerical tolerance of an endpoint, it is
+placed exactly on that endpoint. No road densification is needed.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/04_exact_edge_boundary.svg" alt="A ten-unit network edge split 1.5 units from the left endpoint between clusters A and B.">
+  <figcaption>Figure 4. With \(D(u)=7\), \(D(v)=0\), and \(L=10\), the transition lies exactly 1.5 units from \(u\).</figcaption>
+</figure>
+
+<h3>Why the same-winner case needs no interior search</h3>
+
+<p>Suppose cluster \(c\) wins at both endpoints. Its distance to an interior location is at most</p>
+
+<div class="equation">
+\[
+\min\!\left(D_c(u)+x,\;D_c(v)+L-x\right)
+=
+\min\!\left(D(u)+x,\;D(v)+L-x\right)
+=
+D(x).
+\]
+</div>
+
+<p>But \(D(x)\) is already the minimum over all clusters, so equality must hold. Cluster \(c\) is
+nearest everywhere on that edge.</p>
+
+<h2 id="5-network-cells">5. Collect exact line pieces into cluster cells</h2>
+
+<p>Applying the boundary formula to every reachable edge yields the exact positive-length partition.
+The authoritative table is <code>network_segments</code>: each row identifies one edge piece and its
+cluster. <code>network_cells</code> collects those pieces by cluster without topologically unioning
+coincident graph edges. Components with no source point are returned in
+<code>network_unassigned</code>.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/05_network_cells.svg" alt="Final exact line-network cells colored by clusters A, B and C, plus an unassigned disconnected component.">
+  <figcaption>Figure 5. The network is partitioned exactly in positive length. Adjacent closed LineStrings may meet at their zero-length boundary point.</figcaption>
+</figure>
+
+<p>A cluster is not required to form one connected geographic piece. Because its generator is the set
+of all member points, network topology can legitimately give one cluster several separated pieces.</p>
+
+<h2 id="6-ties-and-topology">6. Ties and topology are explicit, not hidden</h2>
+
+<p>Cluster IDs are compared as strings. Numerical equality uses a local floating-point tolerance based
+only on the distances being compared:</p>
+
+<div class="equation">
+\[
+\tau(a,b)=\max\!\left(10^{-9},\,10^{-12}\max(|a|,|b|)\right).
+\]
+</div>
+
+<p>This avoids allowing a very large distance elsewhere in the network to turn two distinct local
+distances into a tie. At an exact winner tie, the lexicographically smaller cluster ID is the
+deterministic pointwise winner. The positive-length network pieces still meet geometrically at the
+boundary point.</p>
+
+<p>Snapping has a separate ambiguity diagnostic. <code>snap_ties</code> counts distinct nearest
+<strong>network locations</strong>, not the number of equally near segments. At an ordinary junction,
+several incident segments refer to one graph node and therefore count as one location.</p>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/06_topology_and_ties.svg" alt="Comparison of a real shared road junction and a geometric crossing whose lines do not share a vertex.">
+  <figcaption>Figure 6. A shared junction gives one nearest network location. A geometric crossing without a shared vertex can expose two distinct nearest locations.</figcaption>
+</figure>
+
+<h2 id="7-surface-rendering">7. The optional 2-D surface is a rendering of the exact network result</h2>
+
+<p>A network Voronoi diagram naturally partitions network length, not all land around the roads.
+<code>surface_voronoi</code> therefore defines an explicit access model rather than pretending the
+2-D polygon is exact:</p>
+
+<ol>
+  <li>cover the supplied polygon boundary with a regular grid;</li>
+  <li>clip each candidate square to the boundary;</li>
+  <li>choose one representative point from each positive-area cell;</li>
+  <li>attach that representative to its nearest network location;</li>
+  <li>read the <em>exact</em> network cluster at the anchor;</li>
+  <li>dissolve grid cells by cluster.</li>
+</ol>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/07_surface_rendering.svg" alt="Grid cells around a colored network with example representative points attaching to nearest network anchors.">
+  <figcaption>Figure 7. Only the final polygon boundary is discretized. The cluster inherited at each network anchor is taken from the exact edge calculation.</figcaption>
+</figure>
+
+<p>The <code>resolution</code> parameter controls this approximation. <code>surface_grid_debug</code>
+records each cell's anchor edge, edge offset, straight-line access distance, assigned cluster, and
+<code>anchor_ties</code>. <code>surface_point_qa</code> reports whether the rendered polygon of each
+source point's own cluster covers that source point.</p>
+
+<div class="admonition">
+  <strong>Do not reverse the interpretation.</strong>
+  The surface does not define the network cells. The exact line-network partition exists first;
+  the surface samples that partition through nearest-network attachment.
+</div>
+
+<h2 id="8-fast-node-winners">8. How the package gets node winners with few searches</h2>
+
+<p>The direct reference method is simple but can be expensive: run one shortest-path search per
+cluster and compare all cluster distances at every node. The production solver obtains the same
+answer more cheaply when exact ties are sparse.</p>
+
+<p>First, a single multi-source search seeded by <em>all</em> source points gives \(D(v)\), the distance
+to the nearest cluster at every node, plus one provisional source label. If no equal-distance
+competitor was hidden by the shortest-path backend's arbitrary tie choice, that provisional label is
+already the deterministic winner.</p>
+
+<p>The remaining task is therefore only to discover clusters that could replace a provisional label
+under the package's lexical tie rule. The implementation identifies <strong>candidate clusters</strong>
+where provisional labels change across edges that are tight with respect to the nearest-distance
+field. Only those candidates receive their own bounded shortest-path search. A candidate replaces a
+larger label only where its distance passes the final <em>local</em> tie test.</p>
+
+<div class="two-col">
+  <div>
+    <h3>Typical road data</h3>
+    <p>Exact ties are rare. There are few or no candidate clusters, so most of the network partition
+    comes from one global multi-source search.</p>
+  </div>
+  <div>
+    <h3>Tie-heavy data</h3>
+    <p>On highly symmetric inputs, many clusters become candidates and the cost can approach the
+    direct one-search-per-cluster method. The result remains the same.</p>
+  </div>
+</div>
+
+<p>The test suite keeps the slow direct implementation in <code>tests/reference.py</code> and compares
+the optimized solver against it on random networks, tie-heavy grids, and cross-scale near-tie cases.
+The network-wide tolerance used during candidate discovery is only a conservative search bound; it
+is <strong>not</strong> the semantic tie rule.</p>
+
+<h2 id="from-math-to-the-package">From the derivation to the package</h2>
+
+<figure class="tutorial-figure">
+  <img src="assets/tutorial/08_package_pipeline.svg" alt="Pipeline from roads and clustered points through SpatialNetwork, node partition, exact edge boundaries, network cells and optional surface cells.">
+  <figcaption>Figure 8. The code mirrors the derivation: build the graph, solve node winners, split edges analytically, then optionally render the result over a polygon.</figcaption>
+</figure>
+
+<pre><code class="language-python">import geopandas as gpd
+from netvoronoi import from_geodataframes, network_voronoi, surface_voronoi
+
+roads = gpd.read_file("roads.gpkg", layer="roads")
+points = gpd.read_parquet("clustered_points.parquet")
+
+network = from_geodataframes(
+    roads,
+    points,
+    cluster_col="cluster_id",
+    point_id_col="canonical_id",
+    max_snap_distance=500,
+)
+
+# Exact line-network Voronoi partition:
+exact = network_voronoi(network)
+exact.segments
+exact.cells
+exact.unassigned
+
+# Optional 2-D rendering:
+boundary = gpd.read_file("boundary.gpkg", layer="boundary")
+surface = surface_voronoi(network, boundary, resolution=100)
+surface.cells
+surface.grid
+surface.point_qa</code></pre>
+
+<pre><code class="language-text">road lines + clustered points
+        ↓
+snap points and insert source nodes
+        ↓
+SpatialNetwork
+        ↓
+nearest-cluster field D(v) + deterministic node winners
+        ↓
+closed-form boundary on each site-free edge
+        ↓
+network_segments  →  network_cells
+        ↓ optional nearest-network attachment on a grid
+surface_cells + surface_grid_debug + surface_point_qa</code></pre>
+
+<h2 id="standard-vs-net-voronoi">What is standard network Voronoi and what is specific to <code>net-voronoi</code>?</h2>
+
+<table>
+<thead><tr><th>Stage</th><th>Ordinary graph/network Voronoi idea</th><th><code>net-voronoi</code></th></tr></thead>
+<tbody>
+<tr><td>Generators</td><td>Usually one source vertex or point per Voronoi site</td><td>Each cluster is a compound generator containing all of its labelled source points</td></tr>
+<tr><td>Metric</td><td>Shortest-path distance on a graph/network</td><td>Shortest-path distance using geometric edge length on the supplied undirected line network</td></tr>
+<tr><td>Cluster distance</td><td>Distance to one generator</td><td>Minimum distance to any member point of the cluster</td></tr>
+<tr><td>Continuous edges</td><td>Graph formulations may classify vertices</td><td>Source points are inserted as nodes, then every site-free line edge is split at its exact continuous boundary</td></tr>
+<tr><td>Ties</td><td>Implementation-dependent unless specified</td><td>Lexicographically smallest string cluster ID, with a local numerical tolerance</td></tr>
+<tr><td>Disconnected graph</td><td>Handled componentwise</td><td>Components without any source point are explicitly returned as <code>network_unassigned</code></td></tr>
+<tr><td>Off-network area</td><td>Not part of the line-network Voronoi object</td><td>Optional grid approximation under an explicit nearest-network attachment model</td></tr>
+</tbody>
+</table>
+
+<h2 id="scope-and-interpretation">Scope and interpretation</h2>
+
+<p><code>net-voronoi</code> currently assumes a projected, undirected simple line network whose edge
+impedance is geometric length. Shared input vertices define junctions. Directed travel, turn
+restrictions, arbitrary travel-time impedance, and automatic repair of uncertain topology are outside
+the present model.</p>
+
+<p>Cluster labels are literal strings for ordering purposes. A clustering noise label such as
+<code>-1</code> is therefore one ordinary cluster containing every point carrying that label. Remove or
+relabel noise points before running <code>net-voronoi</code> if they should not compete for territory.</p>
+
+<p>The central interpretation is intentionally narrow:</p>
+
+<div class="equation">
+\[
+\boxed{
+\text{network location }x
+\text{ belongs to }
+\arg\min_c\;
+\min_{p\in P_c} d_N(p,x)
+}
+\]
+</div>
+
+<p>Everything else in the package—snapping, exact edge splitting, deterministic ties, QA layers, and
+the optional surface—is machinery for computing or rendering that definition consistently.</p>
+
+<h2 id="references">References</h2>
+
+<ul>
+  <li>Erwig, M. (2000). <em>The graph Voronoi diagram with applications</em>. Networks, 36(3), 156–163. <a href="https://doi.org/10.1002/1097-0037(200010)36:3%3C156::AID-NET2%3E3.0.CO;2-L">DOI</a>.</li>
+  <li>Okabe, A. &amp; Sugihara, K. (2012). <em>Spatial Analysis along Networks: Statistical and Computational Methods</em>, Chapter 4: Network Voronoi Diagrams. Wiley. <a href="https://doi.org/10.1002/9781119967101.ch4">DOI</a>.</li>
+  <li><a href="https://github.com/miraflor/net-voronoi">net-voronoi source repository</a> — implementation, DESIGN.md, tests, and command-line interface.</li>
+</ul>
+
+<footer class="page-footer">
+  <div><strong>net-voronoi</strong><br>Cluster-based Voronoi regions using shortest-path distance on spatial networks.</div>
+  <div><a href="https://github.com/miraflor/net-voronoi">GitHub</a> · <a href="https://github.com/miraflor/net-voronoi/issues">Issues</a></div>
+</footer>
+
+    </article>
+  </main>
+  <button class="back-to-top" id="back-to-top" aria-label="Back to top">↑</button>
+</body>
+</html>

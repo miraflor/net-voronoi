@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" role="img" aria-labelledby="title desc">
+<title id="title">Each reachable graph node receives the nearest cluster and nearest-cluster distance.</title>
+<desc id="desc">Each reachable graph node receives the nearest cluster and nearest-cluster distance.</desc>
+<rect width="100%" height="100%" fill="#fff"/>
+<style>
+text{font-family:Segoe UI,Roboto,Arial,sans-serif;fill:#2d3436}
+.small{font-size:14px} .label{font-size:16px;font-weight:600} .tiny{font-size:12px;fill:#65757c}
+.road{stroke:#66757c;stroke-width:10;stroke-linecap:round;fill:none}
+.thin{stroke:#66757c;stroke-width:3;fill:none} .dash{stroke-dasharray:7 6}
+.node{stroke:#fff;stroke-width:2}
+</style>
+
+<text x="48" y="42" class="label">Shortest-path fields determine a winner at every reachable graph node</text>
+<path d="M 120 275 L 760 275 M 420 70 L 420 455" class="road"/>
+<path d="M 700 90 L 825 145" class="road" stroke="#aeb9be"/>
+<!-- colored winner nodes -->
+<circle cx="120" cy="275" r="12" fill="#2e86de" class="node"/>
+<circle cx="420" cy="275" r="12" fill="#2e86de" class="node"/>
+<circle cx="420" cy="132" r="12" fill="#2e86de" class="node"/>
+<circle cx="420" cy="70" r="12" fill="#2e86de" class="node"/>
+<circle cx="760" cy="275" r="12" fill="#e67e22" class="node"/>
+<circle cx="420" cy="455" r="12" fill="#27ae60" class="node"/>
+<circle cx="700" cy="90" r="11" fill="#aeb9be" class="node"/>
+<circle cx="825" cy="145" r="11" fill="#aeb9be" class="node"/>
+<!-- labels -->
+<text x="75" y="310" class="small">A, D=0</text>
+<text x="355" y="310" class="small">A, D=7</text>
+<text x="440" y="137" class="small">A, D=0</text>
+<text x="440" y="76" class="small">A, D=3</text>
+<text x="772" y="310" class="small">B, D=0</text>
+<text x="440" y="462" class="small">C, D=0</text>
+<text x="690" y="195" class="tiny">D = ∞</text>
+<text x="744" y="195" class="tiny">no winner</text>
+<rect x="80" y="410" width="305" height="72" rx="6" fill="#f7f9fa" stroke="#dfe5e8"/>
+<text x="98" y="438" class="small">At the center: min(7, 10, 9) = 7 → A</text>
+<text x="98" y="462" class="small">The disconnected component has no point → unassigned</text>
+<rect x="520" y="385" width="300" height="97" rx="6" fill="#eef6fb" stroke="#b8d9ec"/>
+<text x="538" y="412" class="small">Conceptually: one multi-source shortest-path</text>
+<text x="538" y="432" class="small">field per cluster. The package obtains the same</text>
+<text x="538" y="452" class="small">node winners more cheaply in the usual case;</text>
+<text x="538" y="472" class="small">that optimization is explained below.</text>
+
+</svg>
