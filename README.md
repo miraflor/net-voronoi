@@ -2,16 +2,47 @@
 
 `net-voronoi` builds **cluster-based Voronoi regions informed by shortest-path distance on a spatial network**.
 
-Input points already have cluster labels. The package does not create clusters and does not replace a cluster with a centroid or medoid. For a network location `x` and cluster `c`, it uses
-
-```text
-D(c, x) = min d_N(p, x)
-          p in cluster c
-```
-
-where `d_N` is shortest-path distance on the supplied network. The winning cluster is the one with the smallest `D(c, x)`. Exact ties are resolved by the lexicographically smallest string cluster ID.
+Input points already have cluster labels. The package does not create clusters and does not replace a cluster with a centroid or medoid.
 
 There is **no additive tolerance / epsilon Voronoi mode**. Cells are exclusive in positive network length.
+
+## Method
+
+### Distance from a location to a cluster
+
+For a network location $`x`$ and cluster $`c`$, it uses
+
+```math
+D(c, x) = \min_{p \in c} d_N(p, x)
+```
+
+where $`d_N`$ is shortest-path distance on the supplied network. The winning cluster is the one with the smallest $`D(c, x)`$. Exact ties are resolved by the lexicographically smallest string cluster ID.
+
+In symbols: with $`D(x) = \min_c D(c, x)`$, the distance from $`x`$ to the nearest cluster, the winner at $`x`$ is
+
+```math
+W(x) = \min \bigl\{\, c \;:\; D(c, x) - D(x) \le \tau\bigl(D(c, x),\, D(x)\bigr) \,\bigr\},
+```
+
+where the minimum is taken in string order of the cluster IDs and $`\tau`$ is the local tolerance defined under [Ties and cluster IDs](#ties-and-cluster-ids). A location that no cluster can reach ($`D(x) = \infty`$) is unassigned.
+
+### Exact split of one edge
+
+Every snapped point is a graph node (see [Why the point clusters are preserved](#why-the-point-clusters-are-preserved)), so no point lies inside an edge. On an edge $`(u, v)`$ of length $`L`$, a shortest path from the location at distance $`x`$ from $`u`$ to the nearest cluster leaves the edge through $`u`$ or through $`v`$:
+
+```math
+D(x) = \min\bigl(D(u) + x,\; D(v) + L - x\bigr), \qquad 0 \le x \le L.
+```
+
+If the winners at $`u`$ and $`v`$ are the same cluster, that cluster owns the whole edge. Otherwise the two terms are equal at
+
+```math
+x^* = \frac{D(v) + L - D(u)}{2},
+```
+
+clipped to $`[0, L]`$. The winner at $`u`$ owns $`[0, x^*]`$ and the winner at $`v`$ owns $`[x^*, L]`$. For example, $`D(u) = 2`$, $`D(v) = 4`$ and $`L = 10`$ give $`x^* = 6`$, where both terms equal 8.
+
+A boundary within the tolerance $`\tau`$ of an edge end is moved onto that end, so that no piece shorter than the tolerance is produced. The pieces of every reachable edge therefore cover $`[0, L]`$ without gaps or overlaps. This formula is written once, in `core._edge_boundary`, and the 2-D surface uses the same function.
 
 ## What the package produces
 
@@ -29,6 +60,14 @@ With a polygon boundary, `net-voronoi` can also render an approximate 2-D surfac
 - `surface_point_qa` — whether each source point is covered by the rendered polygon for its own cluster.
 
 The 2-D layer uses a clear attachment model: each grid-cell representative point attaches to its nearest location on the network and inherits that network location's exact cluster. If several distinct network locations are exactly equally near, the location on the lexicographically smallest string `edge_id` is used and `anchor_ties` records the ambiguity. Finer `--resolution` values give a finer surface approximation.
+
+In symbols: for a grid cell with representative point $`g`$, the anchor $`a(g)`$ and the cell's cluster are
+
+```math
+a(g) = \arg\min_{z \in N} \lVert g - z \rVert, \qquad \mathrm{cluster}(g) = W\bigl(a(g)\bigr),
+```
+
+where $`N`$ is the set of all locations on the network, $`\lVert g - z \rVert`$ is straight-line distance in the CRS, and $`W`$ is the winner defined under [Method](#method). An anchor inside an edge therefore takes the winner of the side of the boundary $`x^*`$ on which it lies, and an anchor exactly on $`x^*`$ is a tie, which goes to the smaller cluster ID.
 
 The GeoPackage also contains the inputs as used: `network_edges`, `points_input`, `points_snapped`, and `snap_connectors` (a straight line from each input point to its snapped node).
 
@@ -53,11 +92,25 @@ Road topology is taken literally from input vertices:
 
 `max_snap_distance` (`--max-snap-distance` in the CLI) limits the distance from each point to its nearest road location. A point is placed on an existing vertex or inserted node when its nearest location is within the segment's tolerance of it, `max(1e-9, 1e-12 × segment length)`, so `snap_distance` can exceed the distance to the road by at most that tolerance.
 
+In symbols, for a nearest segment of length $`\ell`$:
+
+```math
+\tau_{\mathrm{seg}} = \max\bigl(10^{-9},\; 10^{-12}\,\ell\bigr), \qquad \text{snap distance} \le \text{distance to the road} + \tau_{\mathrm{seg}}.
+```
+
 Use a projected CRS. All network distances and `--resolution` values use its linear units. Road and point coordinates must be finite. The graph is an undirected simple graph: parallel edges between the same graph-node pair are not supported.
 
 ## Ties and cluster IDs
 
 Cluster labels are compared as strings. In string order `"c10"` comes before `"c9"`, and the numeric label `10` (string `"10"`) comes before `9` (string `"9"`). Numerical equality uses a local tolerance `max(1e-9, 1e-12 × m)`, where `m` is the magnitude of the distances being compared, in CRS units. A very large distance elsewhere in the network therefore does not turn distinct short-range distances into a tie.
+
+In symbols, two distances $`a`$ and $`b`$ are treated as equal when
+
+```math
+|a - b| \le \tau(a, b), \qquad \tau(a, b) = \max\bigl(10^{-9},\; 10^{-12}\, m\bigr), \quad m = \max\bigl(|a|, |b|\bigr).
+```
+
+For example, two distances of about 1,000,000 m are equal when they differ by at most $`10^{-6}`$ m, and two distances of about 10 m when they differ by at most $`10^{-9}`$ m.
 
 ## Install
 
