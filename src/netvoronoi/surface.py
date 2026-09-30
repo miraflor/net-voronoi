@@ -1,18 +1,23 @@
-"""Approximate 2-D rendering of the exact network Voronoi result.
+"""Approximate 2-D rendering of the exact cluster partition on the network.
 
-Reading order for this module
------------------------------
-1. ``surface_voronoi`` (at the end of the file) is the public entry point.
-   Before any expensive work it checks its arguments and the size of the
-   grid (``check_grid_size``). It then computes the exact network result and
-   runs a four-step pipeline: grid cells, the nearest network location
-   ("anchor") of each cell, the exact memberships at each anchor, and one
-   dissolved polygon layer per membership type.
-2. ``_grid_cells``, ``_anchor_edges`` with ``_anchor_positions``, and
-   ``_memberships_at`` are those steps. Each one works on all cells at the
-   same time with array operations; there is no loop over cells.
+The network partition in ``core.py`` is exact but one-dimensional: it lives
+on the roads. This module answers a different question for the land between
+the roads: if every place attaches to its nearest road location, which
+cluster does it belong to? The answer is computed on a square grid, so it is
+an approximation whose detail is set by ``resolution``.
 
-All distances are in the linear unit of the projected network CRS.
+Reading order:
+
+1. ``surface_voronoi`` checks the inputs, computes the exact network
+   partition, and runs the steps below;
+2. ``_grid`` cuts the boundary into square cells and gives one
+   representative point per cell;
+3. ``_anchor_edges`` attaches each representative point to its nearest
+   network location (the anchor);
+4. ``_assign_anchors`` gives each anchor the exact network cluster at that
+   location, using ``_edge_boundary`` from ``core.py``;
+5. the cells are dissolved by cluster, and ``_point_qa`` checks that every
+   input point lies in the polygon of its own cluster.
 """
 
 from __future__ import annotations
@@ -21,398 +26,329 @@ from dataclasses import dataclass
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import shapely
-from shapely.geometry.base import BaseGeometry
 
-from .core import NetworkVoronoiResult, _tolerance, network_voronoi
+from ._numeric import _count_distinct, _tol
+from .core import NetworkVoronoiResult, _edge_boundary, network_voronoi
 from .model import SpatialNetwork
 
+DEFAULT_MAX_CELLS = 1_000_000
 
-@dataclass
+_POLYGON = 3  # Shapely geometry type ids
+_MULTIPOLYGON = 6
+
+
+@dataclass(frozen=True)
 class SurfaceVoronoiResult:
-    """Approximate 2-D rendering plus its exact network result."""
-
-    hard: gpd.GeoDataFrame
-    epsilon: gpd.GeoDataFrame
+    cells: gpd.GeoDataFrame
     grid: gpd.GeoDataFrame
     unassigned: gpd.GeoDataFrame
+    point_qa: gpd.GeoDataFrame
     network: NetworkVoronoiResult
 
 
-# ---------------------------------------------------------------------------
-# Checks made before any expensive work
-# ---------------------------------------------------------------------------
-
-# Default upper limit for the number of candidate grid squares. For scale: on
-# a 4 GB test machine, with the 22,500-node benchmark network, 200 sites and
-# epsilon = 150, a grid of 950,625 candidate squares (674,694 of them inside a
-# 5,000-vertex boundary) took about 60 s and 0.9 GB of memory. v0.4.0, which
-# had no limit, ran out of memory at 4,000,000 candidate squares.
-DEFAULT_MAX_CELLS = 1_000_000
+# ------------------------------------------------------------ input checks
 
 
-def _check_resolution(resolution) -> float:
-    """Return ``resolution`` as a float; reject zero, negative, NaN and infinity.
+def _boundary_geometry(boundary, crs):
+    """The boundary as one valid Polygon or MultiPolygon in ``crs``.
 
-    Written as ``not (... > 0)`` because every comparison with NaN is false:
-    a plain ``resolution <= 0`` test would let NaN through, and the grid
-    arithmetic would then fail with an unclear error.
+    ``boundary`` is a GeoDataFrame, a GeoSeries, or one Shapely geometry
+    (assumed to be in ``crs`` already). The rows of a GeoDataFrame or
+    GeoSeries are reprojected and merged into one geometry; a single geometry
+    is used as given. Missing and empty rows are ignored.
+
+    Every part must be a Polygon or MultiPolygon with finite coordinates, and
+    must be valid by the GEOS rules (for example, its outline may not cross
+    itself). Invalid geometry is rejected here, with the reason GEOS gives,
+    because the grid clipping in ``_grid`` can otherwise stop with a GEOS
+    error. A tool such as ``shapely.make_valid`` can repair such geometry
+    before it is passed in.
     """
+    from_frame = isinstance(boundary, (gpd.GeoDataFrame, gpd.GeoSeries))
+    if from_frame:
+        if boundary.crs is None:
+            raise ValueError("boundary CRS is missing")
+        parts = boundary.to_crs(crs).geometry.to_numpy()
+    else:
+        parts = np.asarray([boundary], dtype=object)
+
+    parts = parts[~(shapely.is_missing(parts) | shapely.is_empty(parts))]
+    if len(parts) == 0:
+        raise ValueError("boundary is empty")
+    kind = shapely.get_type_id(parts)
+    if np.any((kind != _POLYGON) & (kind != _MULTIPOLYGON)):
+        raise ValueError("boundary must be polygonal")
+    if not np.isfinite(shapely.get_coordinates(parts)).all():
+        raise ValueError("boundary coordinates must be finite")
+    valid = shapely.is_valid(parts)
+    if not valid.all():
+        raise ValueError(f"boundary geometry is invalid: {shapely.is_valid_reason(parts[~valid][0])}")
+    # The union of valid polygons is again a valid Polygon or MultiPolygon.
+    return shapely.union_all(parts) if from_frame else parts[0]
+
+
+def _validate_resolution(resolution: float) -> float:
+    """``resolution`` as a float, after checking that it is finite and positive."""
     resolution = float(resolution)
-    if not (np.isfinite(resolution) and resolution > 0.0):
-        raise ValueError(f"resolution must be a finite positive number, got {resolution!r}")
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError("resolution must be finite and positive")
     return resolution
 
 
-def _check_max_cells(max_cells) -> int | None:
-    """Return ``max_cells`` as an int, or ``None`` (no limit); reject anything else.
+def _grid_shape(boundary, resolution: float) -> tuple[int, int]:
+    """Number of grid columns and rows needed to cover the bounding box of the boundary."""
+    x0, y0, x1, y1 = boundary.bounds
+    nx = max(1, int(np.ceil((x1 - x0) / resolution)))
+    ny = max(1, int(np.ceil((y1 - y0) / resolution)))
+    return nx, ny
 
-    ``True`` is rejected on purpose, because Python treats it as the integer 1.
+
+def _candidate_count(boundary, resolution: float) -> int:
+    """Number of grid squares before clipping to the boundary."""
+    nx, ny = _grid_shape(boundary, resolution)
+    return nx * ny
+
+
+def check_grid_size(boundary, crs, resolution: float, max_cells: int | None = DEFAULT_MAX_CELLS) -> int:
+    """Return the number of grid squares; raise ``ValueError`` when it exceeds ``max_cells``."""
+    resolution = _validate_resolution(resolution)
+    geom = _boundary_geometry(boundary, crs)
+    count = _candidate_count(geom, resolution)
+    if max_cells is not None:
+        if isinstance(max_cells, bool):
+            raise ValueError("max_cells must be a positive integer or None")
+        try:
+            numeric = float(max_cells)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_cells must be a positive integer or None") from exc
+        if not np.isfinite(numeric) or numeric < 1 or numeric != np.floor(numeric):
+            raise ValueError("max_cells must be a positive integer or None")
+        limit = int(numeric)
+        if count > limit:
+            raise ValueError(
+                f"surface grid would require {count:,} candidate cells, exceeding max_cells={limit:,}; "
+                "use a coarser resolution or deliberately raise max_cells"
+            )
+    return count
+
+
+# ------------------------------------------------------------------ 2. grid
+
+
+def _grid(boundary, resolution: float) -> tuple[np.ndarray, np.ndarray]:
+    """Grid cells clipped to the boundary, and one representative point per cell.
+
+    The grid has exactly the ``(nx, ny)`` shape counted by the allocation
+    guard. The grid lines are computed once, and every square takes its four
+    sides from these shared lines. A square's right side is therefore the
+    same number as its right neighbour's left side, so dissolving adjacent
+    squares leaves no gaps. (Computing ``left + resolution`` separately for
+    each square does not guarantee this: the two sums can differ in the last
+    bits.)
     """
-    if max_cells is None:
-        return None
-    if isinstance(max_cells, bool) or not isinstance(max_cells, (int, np.integer)):
-        raise ValueError(f"max_cells must be a positive integer or None, got {max_cells!r}")
-    if max_cells < 1:
-        raise ValueError(f"max_cells must be a positive integer or None, got {max_cells!r}")
-    return int(max_cells)
+    x0, y0, _, _ = boundary.bounds
+    nx, ny = _grid_shape(boundary, resolution)
+    xs = x0 + np.arange(nx + 1, dtype=float) * resolution
+    ys = y0 + np.arange(ny + 1, dtype=float) * resolution
+    # Square (col, row) spans xs[col] to xs[col + 1] and ys[row] to ys[row + 1].
+    # The squares are listed column by column (x outer, y inner); ``cell_id``
+    # in the output follows this order.
+    col, row = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    col, row = col.ravel(), row.ravel()
+    squares = shapely.box(xs[col], ys[row], xs[col + 1], ys[row + 1])
+    # Keep the part of each square inside the boundary, and drop squares
+    # that only touch it.
+    intersects = shapely.intersects(squares, boundary)
+    clipped = shapely.intersection(squares[intersects], boundary)
+    positive = shapely.area(clipped) > 0
+    clipped = clipped[positive]
+    return clipped, shapely.point_on_surface(clipped)
 
 
-def _boundary_geometry(boundary, network_crs):
-    """Return one valid polygon in network CRS units.
+# --------------------------------------------------------------- 3. anchors
 
-    A bare Shapely geometry has no CRS metadata, so it is assumed to already be
-    expressed in ``network_crs``.  GeoPandas inputs are reprojected explicitly.
+
+def _anchor_edges(network: SpatialNetwork, points: np.ndarray):
+    """Nearest network edge and position on it for every representative point.
+
+    Returns ``(edge, offset, access, ties)``: the edge position in
+    ``network.edges``, the network distance from the edge's ``u`` end to the
+    anchor, the straight-line distance from the point to the anchor, and the
+    number of distinct network locations at that nearest distance.
+
+    When several edges are exactly equally near, the one with the smallest
+    ``edge_id`` (string order) is used. An offset within the numerical
+    tolerance of an edge end is set to exactly that end, as in point
+    snapping. Edges that meet at the nearest node offer one location (that
+    node), so a point next to a junction is not counted as ambiguous.
     """
-    if isinstance(boundary, gpd.GeoDataFrame):
-        if boundary.crs is None:
-            raise ValueError("boundary has no CRS")
-        work = boundary.to_crs(network_crs) if boundary.crs != network_crs else boundary
-        geom = work.geometry.union_all()
-    elif isinstance(boundary, gpd.GeoSeries):
-        if boundary.crs is None:
-            raise ValueError("boundary has no CRS")
-        work = boundary.to_crs(network_crs) if boundary.crs != network_crs else boundary
-        geom = work.union_all()
-    elif isinstance(boundary, BaseGeometry):
-        geom = boundary
-    else:
-        raise TypeError(
-            "boundary must be a Polygon/MultiPolygon geometry, GeoSeries, or GeoDataFrame"
-        )
+    edges = network.edges
+    lines = edges.geometry.to_numpy()
+    # ``query_nearest`` returns all equally near edges as (point, edge) index
+    # pairs with their distances. A point with two nearest edges appears in
+    # two pairs.
+    (pidx, eidx), distance = shapely.STRtree(lines).query_nearest(
+        points, all_matches=True, return_distance=True
+    )
+    # Sort the pairs by point and then by the string order of edge_id, so that
+    # the first pair of each point holds the nearest edge with the smallest
+    # edge_id.
+    edge_ids = edges["edge_id"].astype(str).to_numpy()
+    id_rank = np.empty(len(edge_ids), dtype=np.int64)
+    id_rank[np.argsort(edge_ids, kind="stable")] = np.arange(len(edge_ids))
+    order = np.lexsort((id_rank[eidx], pidx))
+    pidx, eidx, distance = pidx[order], eidx[order], distance[order]
+    first = np.r_[True, pidx[1:] != pidx[:-1]]
+    if first.sum() != len(points):
+        raise RuntimeError("failed to find a nearest network edge for a surface cell")
 
-    if geom.is_empty:
-        raise ValueError("boundary is empty")
-    if geom.geom_type not in {"Polygon", "MultiPolygon"}:
-        raise ValueError("boundary must resolve to a Polygon or MultiPolygon")
-    if not geom.is_valid:
-        raise ValueError("boundary geometry is invalid; repair it before surface rendering")
-    return geom
+    # Network distance from the u end to the anchor, for every pair. The
+    # geometric position is rescaled to the ``length`` column, which is the
+    # network distance; the two agree within the tolerance.
+    L = edges["length"].to_numpy(float)[eidx]
+    measure = shapely.line_locate_point(lines[eidx], points[pidx])
+    offset = L * measure / shapely.length(lines[eidx])
+    t = _tol(L)
+    offset = np.where(offset <= t, 0.0, np.where(L - offset <= t, L, offset))
 
-
-def _grid_shape(boundary, resolution: float) -> tuple[float, float, int, int]:
-    """Origin and size of the square grid that covers ``boundary``.
-
-    Returns ``(x0, y0, nx, ny)``. The grid starts at ``(x0, y0)``, which is the
-    lower-left corner of the boundary's bounding box rounded down to whole
-    multiples of ``resolution``, and it has ``nx`` columns and ``ny`` rows.
-    ``nx * ny`` is the number of candidate squares, counted before any square
-    is clipped to the boundary or dropped. Both the size check and the grid
-    itself use this function, so the number that is checked is the number
-    that is built.
-    """
-    minx, miny, maxx, maxy = boundary.bounds
-    x0 = np.floor(minx / resolution) * resolution
-    y0 = np.floor(miny / resolution) * resolution
-    nx = int(np.ceil((maxx - x0) / resolution))
-    ny = int(np.ceil((maxy - y0) / resolution))
-    return x0, y0, nx, ny
+    # Describe each anchor location by one integer: the node id at an edge
+    # end, otherwise ``-1 - edge position``, a negative number that no other
+    # edge and no node can have. Equally near edges that meet at one node
+    # then count as one location.
+    u = edges["u"].to_numpy(np.int64)[eidx]
+    v = edges["v"].to_numpy(np.int64)[eidx]
+    location = np.where(offset == 0.0, u, np.where(offset == L, v, -1 - eidx))
+    ties = _count_distinct(pidx, location, len(points))
+    return eidx[first], offset[first], distance[first], ties
 
 
-def _require_grid_size(boundary, resolution: float, max_cells: int | None) -> int:
-    """Return the number of candidate squares; raise if it is above ``max_cells``."""
-    _, _, nx, ny = _grid_shape(boundary, resolution)
-    candidates = nx * ny
-    if max_cells is not None and candidates > max_cells:
-        raise ValueError(
-            f"the surface grid would have {candidates:,} candidate cells "
-            f"({nx:,} columns x {ny:,} rows), above max_cells={max_cells:,}. "
-            "Use a larger resolution value (larger cells) or a larger max_cells."
-        )
-    return candidates
-
-
-def check_grid_size(
-    boundary, crs, resolution: float, max_cells: int | None = DEFAULT_MAX_CELLS
-) -> int:
-    """Check the size of the surface grid before any expensive work.
-
-    This is the same check that ``surface_voronoi`` makes first. It needs only
-    the boundary, the network CRS (the boundary is measured in its units) and
-    ``resolution``, and it reads only the boundary's bounding box, so it is
-    fast. The CLI calls it before it builds the road network.
-
-    Returns the number of candidate squares. Raises ``ValueError`` when that
-    number is above ``max_cells`` (``None`` means no limit).
-    """
-    resolution = _check_resolution(resolution)
-    max_cells = _check_max_cells(max_cells)
-    if crs is None:
-        raise ValueError("the network CRS is missing, so the grid cannot be measured")
-    return _require_grid_size(_boundary_geometry(boundary, crs), resolution, max_cells)
-
-
-# ---------------------------------------------------------------------------
-# Step 1: grid cells
-# ---------------------------------------------------------------------------
-
-
-def _grid_cells(boundary, resolution: float) -> tuple[np.ndarray, np.ndarray]:
-    """Square cells clipped to ``boundary``, and one interior point per cell.
-
-    The squares have side ``resolution`` and corners on whole multiples of
-    ``resolution``. Cells are numbered column by column: all cells of the
-    first x position from south to north, then the next x position, and so on.
-    A square that does not cover a positive area inside the boundary is left
-    out, so ``cell_id`` counts only the cells that remain.
-
-    Only the squares that the boundary line crosses need a polygon
-    intersection. A square that lies completely inside the boundary is its own
-    cell and is kept as it is, which matters when the boundary has many
-    vertices: on a 5,000-vertex boundary with 25,000 squares this step took
-    1.2 s instead of 9.5 s.
-    """
-    # The size of this grid was already checked by ``_require_grid_size``.
-    x0, y0, nx, ny = _grid_shape(boundary, resolution)
-    ix, iy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")  # x index outer
-    left = x0 + ix.ravel() * resolution
-    bottom = y0 + iy.ravel() * resolution
-    squares = shapely.box(left, bottom, left + resolution, bottom + resolution)
-
-    # ``prepare`` attaches a spatial index to the boundary for the two tests
-    # below; the shape itself does not change.
-    shapely.prepare(boundary)
-    inside = shapely.contains_properly(boundary, squares)
-    crossing = shapely.intersects(boundary, squares) & ~inside
-    cells = np.where(inside, squares, None)
-    cells[crossing] = shapely.intersection(squares[crossing], boundary)
-
-    # Squares outside the boundary are still ``None`` here; a square that only
-    # touches the boundary line gives a cell of zero area. Both are dropped.
-    keep = inside | (crossing & (shapely.area(cells) > 0))
-    cells = cells[keep]
-    return cells, shapely.point_on_surface(cells)
-
-
-# ---------------------------------------------------------------------------
-# Step 2: the anchor of each cell
-# ---------------------------------------------------------------------------
-
-
-def _anchor_edges(network: SpatialNetwork, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Nearest edge of every point, and the number of equally near edges.
-
-    ``query_nearest`` reports every edge at the smallest distance. When
-    several edges are exactly equally near, the one whose ``edge_id`` comes
-    first as text is used, so edge ``10`` comes before edge ``9``. A validated
-    network has at least one edge, so every point has a nearest edge.
-
-    Returns row positions in the edge table, and the tie count per point.
-    """
-    lines = network.edges.geometry.to_numpy()
-    point_of_pair, edge_of_pair = shapely.STRtree(lines).query_nearest(points, all_matches=True)
-
-    # ``rank[e]`` is the position of edge ``e`` when the edge IDs are sorted
-    # as text. Sorting the pairs by point and then by that rank puts each
-    # point's chosen edge first among its pairs.
-    text_ids = np.asarray([str(value) for value in network.edges["edge_id"].tolist()], dtype=object)
-    rank = np.empty(len(lines), dtype=int)
-    rank[np.argsort(text_ids, kind="stable")] = np.arange(len(lines))
-    order = np.lexsort((rank[edge_of_pair], point_of_pair))
-    point_of_pair, edge_of_pair = point_of_pair[order], edge_of_pair[order]
-    first_of_point = np.r_[True, point_of_pair[1:] != point_of_pair[:-1]]
-
-    edge = np.full(len(points), -1, dtype=int)
-    edge[point_of_pair[first_of_point]] = edge_of_pair[first_of_point]
-    if np.any(edge < 0):  # pragma: no cover - a validated network has edges
-        raise ValueError("the network has no edge to attach a grid cell to")
-    return edge, np.bincount(point_of_pair, minlength=len(points))
-
-
-def _anchor_positions(
-    network: SpatialNetwork, edge: np.ndarray, points: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Where each point sits on its edge, and how far it is from there.
-
-    The position (``edge_offset``) is the network distance of the anchor from
-    edge endpoint ``u``, so it can be compared directly with the ``from_dist``
-    and ``to_dist`` of the exact segment tables. ``access_dist`` is the
-    straight-line distance from the point to its anchor.
-    """
-    lines = network.edges.geometry.to_numpy()[edge]
-    length = network.edges["length"].to_numpy(dtype=float)[edge]
-    measure = shapely.line_locate_point(lines, points)  # geometric distance along the line
-    anchors = shapely.line_interpolate_point(lines, measure)
-    return length * measure / shapely.length(lines), shapely.distance(points, anchors)
-
-
-def _nearest_site_distance(
-    network: SpatialNetwork, node_min_distance: np.ndarray, edge: np.ndarray, offset: np.ndarray
+def _assign_anchors(
+    network: SpatialNetwork, result: NetworkVoronoiResult, edge: np.ndarray, offset: np.ndarray
 ) -> np.ndarray:
-    """Network distance from each anchor to its nearest site (NaN if none).
+    """Exact network cluster at every anchor, or ``None`` on an unreachable component.
 
-    A path from the anchor leaves its edge through endpoint ``u`` or through
-    endpoint ``v``.
+    An anchor on an end node takes that node's winner. An anchor inside an
+    edge takes the winner of the side of ``_edge_boundary`` it lies on, which
+    is the same rule that cuts ``network_segments``. An anchor on the boundary
+    itself (within the tolerance) is a tie and goes to the lexicographically
+    smaller cluster ID.
     """
-    u = network.edges["u"].to_numpy(dtype=int)[edge]
-    v = network.edges["v"].to_numpy(dtype=int)[edge]
-    length = network.edges["length"].to_numpy(dtype=float)[edge]
-    value = np.minimum(node_min_distance[u] + offset, node_min_distance[v] + length - offset)
-    return np.where(np.isfinite(value), value, np.nan)
+    u = network.edges["u"].to_numpy(np.int64)[edge]
+    v = network.edges["v"].to_numpy(np.int64)[edge]
+    L = network.edges["length"].to_numpy(float)[edge]
+    A = result.node_min_distance[u]
+    B = result.node_min_distance[v]
+    cu = result.node_cluster[u]
+    cv = result.node_cluster[v]
+
+    # Four cases follow. An anchor on an edge of a component without points
+    # keeps ``None``: its node winners are ``None`` and its distances are inf.
+    at_u = offset == 0.0  # anchor on the u node
+    at_v = ~at_u & (offset == L)  # anchor on the v node
+    inside = ~at_u & ~at_v & np.isfinite(A)  # anchor strictly inside a reachable edge
+    split = inside & (cu != cv)  # ... of an edge whose ends have different winners
+
+    assigned = np.full(len(edge), None, dtype=object)
+    assigned[at_u] = cu[at_u]
+    assigned[at_v] = cv[at_v]
+    same = inside & ~split
+    assigned[same] = cu[same]
+
+    # On a split edge, compare the anchor with the boundary position x. An
+    # anchor within the tolerance t of x is on the boundary: a tie.
+    a, b, length, o = A[split], B[split], L[split], offset[split]
+    x = _edge_boundary(a, b, length)
+    t = _tol(length, a, b)
+    left, right = cu[split], cv[split]
+    smaller = np.where(left < right, left, right)  # string comparison of the two cluster IDs
+    assigned[split] = np.where(o < x - t, left, np.where(o > x + t, right, smaller))
+    return assigned
 
 
-# ---------------------------------------------------------------------------
-# Step 3: memberships at the anchors
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------- 5. QA
 
 
-def _memberships_at(
-    segments: gpd.GeoDataFrame, edge_id: np.ndarray, offset: np.ndarray
-) -> pd.DataFrame:
-    """Every pair (cell, site_id) whose exact segment covers the cell's anchor.
-
-    Each cell is joined to the segments that lie on its own edge, and a
-    segment is kept when ``from_dist <= offset <= to_dist`` with the package's
-    usual small slack for rounding. An anchor exactly on the boundary between
-    two sites therefore belongs to both. The pairs are returned without
-    duplicates, sorted by cell and then by ``site_id``.
-    """
-    columns = ["cell", "site_id"]
-    if segments.empty:
-        return pd.DataFrame({name: [] for name in columns})
-
-    anchors = pd.DataFrame({"cell": np.arange(len(edge_id)), "edge_id": edge_id, "offset": offset})
-    candidates = anchors.merge(
-        segments[["edge_id", "from_dist", "to_dist", "site_id"]], on="edge_id", how="inner"
+def _point_qa(network: SpatialNetwork, surface: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Whether each input point is covered by the surface polygon of its own cluster."""
+    polygons = dict(zip(surface["cluster_id"].astype(str), surface.geometry.to_numpy()))
+    # Preparing a polygon builds a spatial index inside it, which makes the
+    # repeated point-in-polygon tests below faster.
+    shapely.prepare(np.asarray(list(polygons.values()), dtype=object))
+    labels = network.points_input["cluster_id"].astype(str).to_numpy()
+    # The polygon of each point's own cluster, or None when that cluster owns
+    # no surface; ``covers(None, point)`` is False.
+    own = np.asarray([polygons.get(c) for c in labels], dtype=object)
+    contained = shapely.covers(own, network.points_input.geometry.to_numpy())
+    return gpd.GeoDataFrame(
+        {
+            "point_id": network.points_input["point_id"].to_numpy(),
+            "cluster_id": network.points_input["cluster_id"].to_numpy(),
+            "contained": np.asarray(contained, dtype=bool),
+        },
+        geometry=network.points_input.geometry.copy(),
+        crs=network.crs,
     )
-    slack = _tolerance(candidates["offset"].to_numpy(dtype=float))
-    covers = (candidates["from_dist"] - slack <= candidates["offset"]) & (
-        candidates["offset"] <= candidates["to_dist"] + slack
-    )
-    pairs = candidates.loc[covers, columns].drop_duplicates()
-    return pairs.sort_values(columns, kind="stable").reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Step 4: cells to polygon layers
-# ---------------------------------------------------------------------------
-
-
-def _dissolved_by_site(site_id, geometry, crs) -> gpd.GeoDataFrame:
-    """One row per site: the union of the cells that belong to it."""
-    if len(site_id) == 0:
-        return gpd.GeoDataFrame(columns=["site_id", "geometry"], geometry="geometry", crs=crs)
-    frame = gpd.GeoDataFrame({"site_id": site_id}, geometry=gpd.GeoSeries(geometry, crs=crs))
-    return frame.dissolve(by="site_id", as_index=False)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- 1. entry
 
 
 def surface_voronoi(
     network: SpatialNetwork,
     boundary,
-    epsilon: float = 0.0,
+    *,
     resolution: float = 100.0,
-    batch_size: int = 32,
     max_cells: int | None = DEFAULT_MAX_CELLS,
 ) -> SurfaceVoronoiResult:
-    """Render network Voronoi membership approximately over a 2-D polygon.
+    """Render cluster cells over a polygon using nearest-network attachment.
 
-    A representative point from each clipped grid cell is attached to its
-    nearest network location and inherits the exact membership at that anchor.
-    The result is therefore a grid approximation to an explicit nearest-network
-    access model; it is not an exact continuous 2-D network-induced Voronoi.
-
-    ``resolution`` and all reported distances use the projected network CRS
-    units.  A bare Shapely ``boundary`` is assumed to use that same CRS.
-    ``max_cells`` limits the number of candidate grid squares in the boundary's
-    bounding box (see ``DEFAULT_MAX_CELLS`` for what the default costs). The
-    limit is checked before any expensive work; pass ``None`` to disable it
-    deliberately.
-
-    Order of work: the cheap checks (arguments and grid size), then the exact
-    network result (which also validates the network, ``epsilon`` and
-    ``batch_size``), then the grid and everything that depends on it. A wrong
-    argument is therefore reported before the grid is built.
-
-    The ``unassigned`` layer is one dissolved polygon of the cells whose
-    anchor no site can reach; those cells are also in ``grid``, with an empty
-    ``hard_site``.
+    This is a grid approximation of a defined 2-D access model: each grid-cell
+    representative point attaches to its nearest location on the road network
+    and inherits that location's exact network Voronoi cluster.
     """
-    resolution = _check_resolution(resolution)
-    max_cells = _check_max_cells(max_cells)
+    resolution = _validate_resolution(resolution)
     boundary_geom = _boundary_geometry(boundary, network.crs)
-    _require_grid_size(boundary_geom, resolution, max_cells)
-
-    network_result = network_voronoi(network, epsilon=epsilon, batch_size=batch_size)
-
-    # 1. Grid cells and one representative point per cell.
-    cells, points = _grid_cells(boundary_geom, resolution)
+    check_grid_size(boundary_geom, network.crs, resolution, max_cells)
+    net = network_voronoi(network)
+    cells, reps = _grid(boundary_geom, resolution)
     if len(cells) == 0:
-        raise ValueError("boundary produced no grid cells")
+        raise ValueError("boundary produced no positive-area grid cells")
 
-    # 2. The nearest network location of every representative point.
-    edge, anchor_ties = _anchor_edges(network, points)
-    edge_offset, access_dist = _anchor_positions(network, edge, points)
+    edge, offset, access, anchor_ties = _anchor_edges(network, reps)
+    assigned = _assign_anchors(network, net, edge, offset)
     edge_id = network.edges["edge_id"].to_numpy()[edge]
 
-    # 3. Exact memberships at the anchors. For the hard layer, an anchor on
-    #    the boundary between two sites goes to the smaller site_id.
-    hard_pairs = _memberships_at(network_result.hard_segments, edge_id, edge_offset)
-    hard_site = hard_pairs.groupby("cell")["site_id"].min()
-    epsilon_pairs = _memberships_at(network_result.epsilon_segments, edge_id, edge_offset)
-    n_epsilon = epsilon_pairs.groupby("cell").size()
-
-    cell_id = np.arange(len(cells))
-    site_per_cell = hard_site.reindex(cell_id).to_numpy(dtype=object)
-    site_per_cell = np.where(pd.isna(site_per_cell), None, site_per_cell)
     grid = gpd.GeoDataFrame(
         {
-            "cell_id": cell_id,
+            "cell_id": np.arange(len(cells), dtype=int),
+            "cluster_id": assigned,
             "edge_id": edge_id,
-            "edge_offset": edge_offset,
-            "nearest_site_dist": _nearest_site_distance(
-                network, network_result.node_min_distance, edge, edge_offset
-            ),
-            "access_dist": access_dist,
-            "hard_site": list(site_per_cell),
-            "n_epsilon": n_epsilon.reindex(cell_id, fill_value=0).to_numpy(dtype=int),
+            "edge_offset": offset,
+            "access_dist": access,
             "anchor_ties": anchor_ties,
         },
         geometry=gpd.GeoSeries(cells, crs=network.crs),
         crs=network.crs,
     )
 
-    # 4. Dissolve the cells into one polygon per site, and one for the rest.
-    assigned = hard_site.index.to_numpy()
-    unassigned_cell = np.setdiff1d(cell_id, assigned)
-    if len(unassigned_cell):
-        unassigned = gpd.GeoDataFrame(
-            geometry=gpd.GeoSeries(cells[unassigned_cell], crs=network.crs)
-        ).dissolve()
+    assigned_grid = grid[grid["cluster_id"].notna()].copy()
+    if assigned_grid.empty:
+        surface = gpd.GeoDataFrame(columns=["cluster_id", "geometry"], geometry="geometry", crs=network.crs)
     else:
+        surface = assigned_grid.dissolve(by="cluster_id", as_index=False)
+        surface = surface[["cluster_id", "geometry"]].sort_values("cluster_id").reset_index(drop=True)
+
+    missing = grid[grid["cluster_id"].isna()].copy()
+    if missing.empty:
         unassigned = gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=network.crs)
+    else:
+        unassigned = missing[["geometry"]].dissolve().reset_index(drop=True)
 
     return SurfaceVoronoiResult(
-        hard=_dissolved_by_site(hard_site.to_numpy(), cells[assigned], network.crs),
-        epsilon=_dissolved_by_site(
-            epsilon_pairs["site_id"].to_numpy(), cells[epsilon_pairs["cell"].to_numpy()], network.crs
-        ),
+        cells=surface,
         grid=grid,
         unassigned=unassigned,
-        network=network_result,
+        point_qa=_point_qa(network, surface),
+        network=net,
     )

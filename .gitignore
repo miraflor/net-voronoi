@@ -5,5 +5,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-output/
 *.gpkg
+.DS_Store

@@ -1,8 +1,8 @@
-"""Network-distance Voronoi diagrams and additive-epsilon catchments."""
+"""Cluster-based network-informed Voronoi regions."""
 
 from .core import NetworkVoronoiResult, network_voronoi
 from .model import SpatialNetwork
-from .spaghetti_backend import from_geodataframes
+from .network import from_geodataframes
 from .surface import SurfaceVoronoiResult, surface_voronoi
 
 __all__ = [
@@ -14,4 +14,4 @@ __all__ = [
     "surface_voronoi",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

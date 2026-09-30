@@ -1,15 +1,24 @@
-"""Exact lineal network Voronoi cells and additive-epsilon memberships.
+"""Exact lineal Voronoi partition of a network by point clusters.
 
-Reading order for this module
------------------------------
-1. ``network_voronoi`` (at the end of the file) is the public entry point. It
-   is a three-step pipeline: the nearest-site distance at every graph node,
-   one shortest-path search per site, and the exact split of every edge.
-2. ``_epsilon_interval`` contains all of the per-edge mathematics. The hard
-   Voronoi boundary is the same formula with ``epsilon = 0``.
-3. The remaining helpers move numbers into GeoDataFrames.
+The question this module answers: for every location on the road network,
+which cluster has a point closest to it along the roads?
 
-All distances are in the linear unit of the projected network CRS.
+Definitions. The distance from cluster ``c`` to a network location ``x``,
+``D(c, x)``, is the shortest-path distance from ``x`` to the nearest point
+tagged ``c``. The winner at ``x`` is the cluster with the smallest
+``D(c, x)``. Numerically equal distances go to the lexicographically smallest cluster
+ID; the floating-point tolerance is local to the distances being compared and
+is described in ``_node_partition``.
+
+``network_voronoi`` is a short pipeline, in reading order:
+
+1. ``_node_partition`` gives, at every graph node, the distance to the
+   nearest cluster and the winning cluster;
+2. ``_edge_boundary`` gives the position where the winner changes on an edge
+   whose two end nodes have different winners. It is the only per-edge
+   formula in the package; ``surface.py`` uses the same function;
+3. ``_cut_edges`` and ``_collect_cells`` cut the edge lines at those
+   positions and collect the pieces by cluster.
 """
 
 from __future__ import annotations
@@ -18,501 +27,356 @@ from dataclasses import dataclass
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import shapely
 from scipy.sparse.csgraph import dijkstra
 from shapely.ops import substring
 
-from .model import SpatialNetwork
+from ._numeric import _tol
+from .model import SpatialNetwork, _graph_matrix
 
 
-@dataclass
+@dataclass(frozen=True)
 class NetworkVoronoiResult:
-    """Exact lineal hard and additive-epsilon Voronoi outputs."""
-
-    hard_segments: gpd.GeoDataFrame
-    epsilon_segments: gpd.GeoDataFrame
-    hard_cells: gpd.GeoDataFrame
-    epsilon_cells: gpd.GeoDataFrame
+    segments: gpd.GeoDataFrame
+    cells: gpd.GeoDataFrame
     unassigned_edges: gpd.GeoDataFrame
     node_min_distance: np.ndarray
-    epsilon: float
+    node_cluster: np.ndarray
     distance_unit: str | None
 
 
-# ---------------------------------------------------------------------------
-# Numerical tolerance
-# ---------------------------------------------------------------------------
-#
-# Shortest-path distances are sums of floating-point edge lengths, so two
-# distances that are equal in exact arithmetic can differ in their last bits.
-# Every equality or inequality test between network distances in this package
-# allows the following small slack.
-
-_ABSOLUTE_TOLERANCE = 1e-9  # CRS units; the lower limit for small distances
-_RELATIVE_TOLERANCE = 1e-12  # fraction of the largest distance involved
+# ------------------------------------------------------ 1. winners at nodes
 
 
-def _tolerance(*values) -> np.ndarray:
-    """Slack for comparing network distances of the size of ``values``.
+def _smallest_rank_at_nodes(point_node: np.ndarray, point_rank: np.ndarray, n_nodes: int) -> np.ndarray:
+    """For each node, the smallest cluster rank among the points on it; ``-1`` where there is no point.
 
-    The result is ``max(1e-9, 1e-12 * max(1, |v| for every finite v))``.
-    Arguments can be scalars or NumPy arrays; arrays are handled element by
-    element. Infinite values (unreachable nodes) and NaN do not enlarge the
-    slack.
+    Example: points on nodes ``[4, 4, 7]`` with ranks ``[2, 0, 1]`` give
+    rank 0 at node 4, rank 1 at node 7 and -1 elsewhere.
     """
-    scale = np.asarray(1.0)
-    for value in values:
-        magnitude = np.abs(np.asarray(value, dtype=float))
-        scale = np.maximum(scale, np.where(np.isfinite(magnitude), magnitude, 0.0))
-    return np.maximum(_ABSOLUTE_TOLERANCE, _RELATIVE_TOLERANCE * scale)
+    none = np.iinfo(np.int64).max
+    rank = np.full(n_nodes, none, dtype=np.int64)
+    np.minimum.at(rank, point_node, point_rank)  # rank[node] = min(rank[node], rank of the point), for every point
+    rank[rank == none] = -1
+    return rank
 
 
-def _check_epsilon(epsilon: float) -> float:
-    """Return ``epsilon`` as a float; reject negative values and NaN.
+def _tie_candidates(network: SpatialNetwork, dist: np.ndarray, label: np.ndarray, candidate_t: float) -> set[int]:
+    """Clusters that may be the winner at a node where the first search chose another cluster.
 
-    ``math.inf`` is accepted: every site is then a member wherever it can reach
-    at all. NaN needs an explicit test because every comparison with NaN is
-    false: it would pass an ``epsilon < 0`` check and then silently produce an
-    empty epsilon layer.
+    The first search in ``_node_partition`` labels every node ``v`` with the
+    cluster of one nearest point, ``label[v]``. That label is a nearest
+    cluster, but when two clusters are equally near, it may not be the one
+    with the smaller ID.
+
+    Example: a road 0 --- 5 --- 10 with a point of cluster "B" at 0 and a
+    point of cluster "A" at 10. The node at 5 is 5 from both points, and the
+    first search may label it "B". The correct winner is "A".
+
+    Which clusters can be such a missed winner? Let ``c`` be the correct
+    winner at a node ``v`` with ``c != label[v]``, so ``D_c(v)`` is within the
+    local tolerance ``_tol(D_c(v), D(v))`` of ``D(v)``. That local tolerance
+    is at most ``candidate_t``, the tolerance of the largest node distance
+    (apart from a relative difference of about 1e-12, which the margin
+    described at the end covers). Take a shortest path from ``v`` to the
+    nearest point of ``c``, at node ``s``.
+
+    * At ``s``, the label is the smallest cluster among the points on ``s``.
+      That cluster is ``c``: a smaller cluster on ``s`` reaches ``v`` along
+      the same path, so its distance at ``v`` is at most ``D_c(v)``, and it
+      would be the correct winner at ``v`` instead of ``c``. (A smaller
+      distance also passes the local test: lowering a distance by some amount
+      lowers its gap to ``D(v)`` by that amount, and its tolerance by at most
+      ``1e-12`` times that amount.)
+    * Walking from ``v`` towards ``s`` lowers ``D_c`` by exactly the distance
+      walked, while ``D`` can drop by at most that distance. So at every node
+      ``p`` of the path, ``D_c(p) - D(p) <= D_c(v) - D(v) <= candidate_t``,
+      and every edge ``(a, b)`` of the path, with ``a`` nearer to ``s``, is
+      tight within ``candidate_t``::
+
+          D(a) + length <= D_c(a) + length = D_c(b) <= D(b) + candidate_t
+
+    So along the path the label changes from ``c`` (at ``s``) to another
+    cluster (at ``v``) across a tight edge. This function returns the labels
+    at both ends of every tight edge whose two labels differ, so ``c`` is one
+    of them. In the example, the edge from 5 to 10 is tight
+    (``D(10) + 5 = 0 + 5 = D(5)``) and its labels are "B" and "A", so "A"
+    is a candidate.
+
+    ``candidate_t`` is used only to find candidates; whether a candidate
+    really ties at a node is decided later with the local tolerance. A
+    candidate that does not win anywhere only costs one extra search, so the
+    test for "tight" allows ``8 * candidate_t`` for rounding error.
     """
-    epsilon = float(epsilon)
-    if not epsilon >= 0.0:  # false for negative numbers and for NaN
-        raise ValueError(f"epsilon must be a non-negative number, got {epsilon!r}")
-    return epsilon
+    u = network.edges["u"].to_numpy(np.int64)
+    v = network.edges["v"].to_numpy(np.int64)
+    w = network.edges["length"].to_numpy(float)
+    reachable = np.isfinite(dist[u])
+    u, v, w = u[reachable], v[reachable], w[reachable]
+    du, dv = dist[u], dist[v]
+    tight = (du + w - dv <= 8.0 * candidate_t) | (
+        dv + w - du <= 8.0 * candidate_t
+    )  # tight in either direction
+    differ = tight & (label[u] != label[v])
+    return set(label[u[differ]].tolist()) | set(label[v[differ]].tolist())
 
 
-def _check_batch_size(batch_size: int) -> int:
-    """Return a positive integer ``batch_size`` with a clear API error.
+def _node_partition(network: SpatialNetwork) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest-cluster distance ``D(v)`` and winning cluster rank at every node.
 
-    The CLI already parses this option as an integer. This check is for direct
-    Python callers, where values such as ``1.5`` or ``nan`` would otherwise
-    fail later inside ``range`` with a less helpful exception.
+    ``D(v)`` is the minimum over clusters ``c`` of ``D_c(v)``, the
+    shortest-path distance from ``v`` to the nearest point of ``c``. The
+    winner is the smallest cluster rank (``network.cluster_ids`` order) whose
+    ``D_c(v)`` is numerically equal to ``D(v)`` under the local tolerance
+    ``_tol(D_c(v), D(v))``. Using a local tolerance prevents a very large,
+    unrelated part of the network from making distinct distances on a short
+    edge count as a tie. Unreachable nodes get ``D = inf`` and winner ``-1``.
+
+    Method:
+
+    1. One multi-source Dijkstra search from all points at once gives ``D``
+       and, for each node, one nearest point. That point's cluster is the
+       winner, unless a cluster with a smaller ID ties with it.
+    2. ``_tie_candidates`` returns a safe superset of the clusters that can
+       win such a tie. Candidate discovery uses the largest tolerance anywhere
+       in the network, only so that no true local tie is missed. Each candidate
+       then gets its own search and is allowed to replace a winner only where
+       its distance is within the *local* tolerance at that node.
+
+    A network without ties needs a single search. When ties are everywhere
+    (for example, all points on the nodes of a regular grid), every cluster
+    becomes a candidate and the cost approaches one search per cluster.
+
+    ``tests/reference.py`` contains the plain version of this function, with
+    one full search per cluster; the tests check that both agree.
     """
-    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)):
-        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
-    batch_size = int(batch_size)
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
-    return batch_size
+    clusters = network.cluster_ids
+    rank_of = {cluster: i for i, cluster in enumerate(clusters)}
+    labels = network.points_snapped["cluster_id"].astype(str)
+    point_rank = np.fromiter((rank_of[c] for c in labels), dtype=np.int64, count=len(labels))
+    point_node = network.points_snapped["network_node"].to_numpy(np.int64)
+    rank_at_node = _smallest_rank_at_nodes(point_node, point_rank, len(network.nodes))
+    source = np.flatnonzero(rank_at_node >= 0)
 
-
-# ---------------------------------------------------------------------------
-# The mathematics on one edge
-# ---------------------------------------------------------------------------
-
-
-def _epsilon_interval(a, b, A, B, length, epsilon: float):
-    """Exact epsilon-admissible interval of one site on site-free edges.
-
-    Setting
-    -------
-    Take an edge from node ``u`` to node ``v`` with length ``L`` and no site
-    in its interior. Describe a point on the edge by ``x``, its network
-    distance from ``u`` (so ``0 <= x <= L``). A path from any site to that
-    point enters the edge through ``u`` or through ``v``, so for one site ``s``
-
-        d_s(x)   = min(a + x, b + L - x),  with a = d_s(u) and b = d_s(v),
-
-    and for the nearest site
-
-        d_min(x) = min(A + x, B + L - x),  with A = min_h d_h(u), B = min_h d_h(v).
-
-    The site is epsilon-admissible at ``x`` when ``d_s(x) <= d_min(x) + epsilon``.
-
-    Key fact: the excess ``e(x) = d_s(x) - d_min(x)`` is monotone on the edge
-    -------------------------------------------------------------------------
-    Each distance first rises with slope +1 (the route through ``u`` is
-    shorter) and then falls with slope -1 (the route through ``v`` is
-    shorter). Where the two slopes are equal, ``e`` is constant: it equals
-    ``a - A`` near ``u`` and ``b - B`` near ``v``. Between the two slope
-    changes the slopes differ, so ``e`` changes there at the constant rate +2
-    or -2. Therefore ``e`` moves in one direction only, from ``a - A`` to
-    ``b - B``, and the admissible set is a single interval that contains an
-    endpoint (or it is empty).
-
-    Four cases, decided at the two endpoints
-    ----------------------------------------
-    * admissible at ``u`` and at ``v``: the whole edge ``[0, L]``;
-    * admissible at ``u`` only: ``[0, t]``. At ``t`` the site's route through
-      ``u`` meets the nearest-site route through ``v`` plus epsilon:
-      ``a + t = B + L - t + epsilon``, so ``t = (B + L + epsilon - a) / 2``;
-    * admissible at ``v`` only: ``[t, L]`` with ``b + L - t = A + t + epsilon``,
-      so ``t = (b + L - A - epsilon) / 2``;
-    * admissible at neither endpoint: nowhere on the edge.
-
-    Example: ``a = 0, b = 600, A = B = 0, L = 600, epsilon = 100`` is
-    admissible at ``u`` only, so the interval is ``[0, (0 + 600 + 100 - 0) / 2]
-    = [0, 350]``.
-
-    Arguments are NumPy arrays with one element per edge (scalars also work).
-    Returns ``(start, stop, keep)``: the interval bounds, clipped to
-    ``[0, L]``, and a mask of the edges where the interval has positive
-    length. An admissible set that is a single point is dropped on purpose,
-    because the lineal output contains positive-length pieces only.
-    """
-    a, b, A, B, length = (np.asarray(value, dtype=float) for value in (a, b, A, B, length))
-    tol = _tolerance(a, b, A, B, length, epsilon)
-    admissible_at_u = np.isfinite(a) & (a <= A + epsilon + tol)
-    admissible_at_v = np.isfinite(b) & (b <= B + epsilon + tol)
-
-    # Boundary positions for the two one-endpoint cases. Each one is used only
-    # where its case applies; in other elements it can be inf or NaN (for
-    # example, inf - inf for an unreachable site), so those warnings are off.
-    with np.errstate(invalid="ignore"):
-        stop_if_only_u = np.clip((B + length + epsilon - a) / 2.0, 0.0, length)
-        start_if_only_v = np.clip((b + length - A - epsilon) / 2.0, 0.0, length)
-
-    start = np.where(admissible_at_u, 0.0, start_if_only_v)
-    stop = np.where(admissible_at_v, length, stop_if_only_u)
-    with np.errstate(invalid="ignore"):
-        keep = (admissible_at_u | admissible_at_v) & (stop - start > tol)
-    return start, stop, keep
-
-
-# ---------------------------------------------------------------------------
-# Array bundles used by the pipeline
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _EdgeArrays:
-    """Columns of ``network.edges`` as NumPy arrays (edge ``i`` is row ``i``).
-
-    The edge table is read once. Indexing NumPy arrays is much faster than
-    row-by-row pandas access, and the loops below touch edges many times.
-    """
-
-    edge_id: np.ndarray
-    u: np.ndarray
-    v: np.ndarray
-    length: np.ndarray
-    geometry: np.ndarray
-
-    @classmethod
-    def from_network(cls, network: SpatialNetwork) -> _EdgeArrays:
-        edges = network.edges
-        return cls(
-            edge_id=edges["edge_id"].to_numpy(),
-            u=edges["u"].to_numpy(dtype=int),
-            v=edges["v"].to_numpy(dtype=int),
-            length=edges["length"].to_numpy(dtype=float),
-            geometry=edges.geometry.to_numpy(),
-        )
-
-
-@dataclass(frozen=True)
-class _Pieces:
-    """Positive-length pieces of edges, as parallel arrays.
-
-    Element ``k`` describes one piece: ``edge[k]`` is a row position in the
-    edge table, ``start[k]`` and ``stop[k]`` are network distances from that
-    edge's endpoint ``u``, and ``site[k]`` is a position in the site list.
-    """
-
-    edge: np.ndarray
-    start: np.ndarray
-    stop: np.ndarray
-    site: np.ndarray
-
-    @classmethod
-    def concatenate(cls, parts: list[_Pieces]) -> _Pieces:
-        if not parts:
-            empty_int, empty_float = np.empty(0, dtype=int), np.empty(0, dtype=float)
-            return cls(empty_int, empty_float, empty_float, empty_int)
-        return cls(
-            edge=np.concatenate([part.edge for part in parts]),
-            start=np.concatenate([part.start for part in parts]),
-            stop=np.concatenate([part.stop for part in parts]),
-            site=np.concatenate([part.site for part in parts]),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline steps
-# ---------------------------------------------------------------------------
-
-
-def _minimum_node_distances(network: SpatialNetwork) -> np.ndarray:
-    """Distance from every graph node to its nearest site (one search)."""
-    site_nodes = np.unique(np.asarray(network.site_nodes, dtype=int))
-    values = dijkstra(
-        network.adjacency,
-        directed=False,
-        indices=site_nodes,
+    # Step 1. The adjacency stores every edge in both directions (checked by
+    # ``SpatialNetwork.validate``), so a directed search gives undirected
+    # distances, and SciPy does not build the transposed matrix on every call.
+    # ``nearest[v]`` is the source node from which ``v`` was reached.
+    graph = _graph_matrix(network.adjacency)
+    dist, _, nearest = dijkstra(
+        graph,
+        directed=True,
+        indices=source,
         min_only=True,
-        return_predecessors=False,
+        return_predecessors=True,
     )
-    return np.asarray(values, dtype=float)
+    dist = np.asarray(dist, dtype=float)
+    reachable = np.isfinite(dist)
+    winner = np.full(len(dist), -1, dtype=np.int64)
+    winner[reachable] = rank_at_node[nearest[reachable]]
 
-
-def _scan_sites(
-    network: SpatialNetwork,
-    edges: _EdgeArrays,
-    site_ids: np.ndarray,
-    min_dist: np.ndarray,
-    epsilon: float,
-    batch_size: int,
-) -> tuple[np.ndarray, _Pieces]:
-    """Run one shortest-path search per site and collect two results.
-
-    1. The hard winner at every node. Sites are visited in increasing string
-       ``site_id`` order, and a node keeps the first site whose distance
-       equals the node's nearest-site distance. So an exact tie at a node goes
-       to the smallest ``site_id``, independent of the input order and of
-       SciPy's internal tie handling.
-    2. The epsilon pieces. For each site, ``_epsilon_interval`` is evaluated
-       on all edges at once.
-
-    Returns ``(winner, pieces)``. ``winner[node]`` is a position in
-    ``site_ids``, or -1 for a node that no site can reach. The pieces are
-    ordered by site ID and then by edge.
-    """
-    site_nodes = np.asarray(network.site_nodes, dtype=int)
-    order = np.asarray(sorted(range(len(site_ids)), key=lambda i: site_ids[i]), dtype=int)
-    winner = np.full(len(min_dist), -1, dtype=int)
-    min_at_u, min_at_v = min_dist[edges.u], min_dist[edges.v]
-    parts: list[_Pieces] = []
-
-    for first in range(0, len(order), batch_size):
-        batch = order[first : first + batch_size]
-        distances = dijkstra(
-            network.adjacency,
-            directed=False,
-            indices=site_nodes[batch],
-            return_predecessors=False,
+    # Step 2. Candidates are visited in increasing rank, and a candidate only
+    # replaces a larger rank, so each node ends with the smallest rank that
+    # ties there.
+    finite = dist[reachable]
+    largest = float(finite.max()) if finite.size else 0.0
+    # Candidate discovery needs one conservative tolerance that is valid
+    # everywhere. It is deliberately *not* the tie rule itself: final tie
+    # decisions below use a local tolerance based on the two distances being
+    # compared, so that a very large, distant component cannot turn distinct
+    # short-range distances into ties.
+    candidate_t = float(_tol(largest))
+    for c in sorted(_tie_candidates(network, dist, winner, candidate_t)):
+        dist_c = dijkstra(
+            graph,
+            directed=True,
+            indices=np.unique(point_node[point_rank == c]),
+            min_only=True,
+            limit=largest + 2.0 * candidate_t,  # safely covers every possible local tie
         )
-        distances = np.atleast_2d(distances)  # one row per site in the batch
-
-        for site_position, site_dist in zip(batch.tolist(), distances):
-            # 1. Claim the still-unclaimed nodes where this site is nearest.
-            #    (A finite site distance implies a finite nearest distance.)
-            reached = np.isfinite(site_dist)
-            at_minimum = np.zeros(len(site_dist), dtype=bool)
-            at_minimum[reached] = np.abs(site_dist[reached] - min_dist[reached]) <= _tolerance(
-                site_dist[reached], min_dist[reached]
-            )
-            winner[at_minimum & (winner < 0)] = site_position
-
-            # 2. This site's epsilon interval on every edge.
-            start, stop, keep = _epsilon_interval(
-                site_dist[edges.u], site_dist[edges.v], min_at_u, min_at_v, edges.length, epsilon
-            )
-            kept = np.flatnonzero(keep)
-            parts.append(
-                _Pieces(kept, start[kept], stop[kept], np.full(len(kept), site_position, dtype=int))
-            )
-
-    if np.any(np.isfinite(min_dist) & (winner < 0)):
-        raise RuntimeError("failed to resolve a hard Voronoi winner at a reachable node")
-    return winner, _Pieces.concatenate(parts)
+        # First keep the few nodes where c is within 2 * candidate_t of the
+        # minimum (every local tolerance is below that bound), then apply the
+        # exact local test only to them. Computing the local tolerance for
+        # every node instead would cost a pass over the whole network for
+        # each candidate.
+        near = np.flatnonzero(np.isfinite(dist_c) & (dist_c <= dist + 2.0 * candidate_t))
+        local_t = _tol(dist_c[near], dist[near])
+        ties = near[dist_c[near] <= dist[near] + local_t]
+        winner[ties[c < winner[ties]]] = c
+    return dist, winner
 
 
-def _hard_pieces(
-    edges: _EdgeArrays,
-    min_dist: np.ndarray,
-    winner: np.ndarray,
-) -> tuple[_Pieces, np.ndarray]:
-    """Split every reachable edge at its exact hard Voronoi boundary.
+# ------------------------------------------------------- 2. edge boundaries
 
-    If both endpoints of an edge have the same winner, that site is nearest on
-    the whole edge. Otherwise the winner at ``u`` is nearest up to
-    ``(B + L - A) / 2`` and the winner at ``v`` after that point: this is the
-    boundary of ``_epsilon_interval`` with ``epsilon = 0``.
 
-    The node tie rule carries over to the edge interior. Strictly between
-    ``u`` and the boundary, the nearest sites are exactly the sites that are
-    nearest at ``u`` (they arrive through ``u``), and the smallest ID among
-    them is ``winner[u]``. The same holds on the ``v`` side.
+def _edge_boundary(A, B, L) -> np.ndarray:
+    """Position of the cluster boundary on edges whose end nodes have different winners.
 
-    Returns the pieces (ordered by edge, ``u`` side first) and the row
-    positions of edges that no site can reach.
+    An edge ``(u, v)`` of length ``L`` has no point in its interior, because
+    every point was inserted as a node. So the nearest cluster at distance
+    ``x`` from ``u`` is reached through ``u`` or through ``v``, and::
+
+        D(x) = min(A + x, B + L - x),   where A = D(u), B = D(v).
+
+    The first term belongs to the winner at ``u``, the second to the winner
+    at ``v``. They are equal at::
+
+        x* = (B + L - A) / 2,
+
+    so the winner at ``u`` owns ``[0, x*]`` and the winner at ``v`` owns
+    ``[x*, L]``. Example: ``A = 2``, ``B = 4``, ``L = 10`` give ``x* = 6``:
+    at ``x = 6`` both terms equal 8.
+
+    Because ``|A - B| <= L``, ``x*`` lies in ``[0, L]``; clipping only removes
+    rounding error. A boundary within the tolerance of an end is moved onto
+    that end, so that no piece shorter than the tolerance is produced.
     """
-    winner_u, winner_v = winner[edges.u], winner[edges.v]
-    reachable = winner_u >= 0
-    if np.any(reachable != (winner_v >= 0)):
-        # An edge joins its two endpoints, so they are in the same component.
-        raise RuntimeError("an edge joins a reachable and an unreachable node")
-
-    min_at_u, min_at_v, length = min_dist[edges.u], min_dist[edges.v], edges.length
-    with np.errstate(invalid="ignore"):  # inf - inf on unreachable edges
-        boundary = np.clip((min_at_v + length - min_at_u) / 2.0, 0.0, length)
-    same_winner = winner_u == winner_v
-    all_edges = np.arange(len(length))
-
-    u_side = _Pieces(
-        edge=all_edges[reachable],
-        start=np.zeros(int(reachable.sum())),
-        stop=np.where(same_winner, length, boundary)[reachable],
-        site=winner_u[reachable],
-    )
-    split = reachable & ~same_winner
-    v_side = _Pieces(
-        edge=all_edges[split],
-        start=boundary[split],
-        stop=length[split],
-        site=winner_v[split],
-    )
-
-    # Put each edge's u-side piece before its v-side piece; drop pieces of
-    # zero length (a boundary that falls on an endpoint).
-    both = _Pieces.concatenate([u_side, v_side])
-    order = np.argsort(both.edge, kind="stable")
-    both = _Pieces(both.edge[order], both.start[order], both.stop[order], both.site[order])
-    positive = both.stop - both.start > _tolerance(length[both.edge])
-    pieces = _Pieces(
-        both.edge[positive], both.start[positive], both.stop[positive], both.site[positive]
-    )
-    return pieces, np.flatnonzero(~reachable)
+    A, B, L = (np.asarray(a, dtype=float) for a in (A, B, L))
+    x = np.clip((B + L - A) / 2.0, 0.0, L)
+    near_end = np.minimum(x, L - x) <= _tol(L, A, B)
+    return np.where(near_end, np.where(x <= L - x, 0.0, L), x)
 
 
-# ---------------------------------------------------------------------------
-# From pieces to geometry tables
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------ 3. pieces and cells
 
 
-def _cut_lines(geometry, start_fraction, stop_fraction) -> np.ndarray:
-    """Cut the part between two positions out of each line.
+def _split_lines(lines: np.ndarray, fraction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Cut each LineString at ``fraction`` of its length; return the two parts.
 
-    ``start_fraction`` and ``stop_fraction`` give positions along each line
-    as fractions of its length, measured from its first vertex (endpoint
-    ``u``).
-
-    Straight two-vertex lines -- every edge built by the spaghetti adapter --
-    are cut in one vectorized step. The cut points are ``(1 - f) * p + f * q``
-    for the line's vertices ``p`` and ``q``; this form gives exactly ``p`` at
-    ``f = 0`` and exactly ``q`` at ``f = 1``, so a piece that reaches an edge
-    endpoint uses that vertex exactly. Lines with more vertices are cut one
-    at a time with ``shapely.ops.substring``.
+    Networks built by ``from_geodataframes`` have only straight two-point
+    edges. For those, the cut point is computed for all edges at once and the
+    two parts are built directly from it. Custom networks may have edges
+    with bends; those are cut one by one with ``shapely.ops.substring``, which
+    keeps every bend.
     """
-    geometry = np.asarray(geometry, dtype=object)
-    start_fraction = np.asarray(start_fraction, dtype=float)
-    stop_fraction = np.asarray(stop_fraction, dtype=float)
-    pieces = np.empty(len(geometry), dtype=object)
-
-    straight = shapely.get_num_coordinates(geometry) == 2
+    first = np.empty(len(lines), dtype=object)
+    second = np.empty(len(lines), dtype=object)
+    straight = (shapely.get_num_coordinates(lines) == 2) & ~shapely.has_z(lines)
     if straight.any():
-        p = shapely.get_coordinates(shapely.get_point(geometry[straight], 0))
-        q = shapely.get_coordinates(shapely.get_point(geometry[straight], -1))
-        f0 = start_fraction[straight][:, None]
-        f1 = stop_fraction[straight][:, None]
-        first_points = (1.0 - f0) * p + f0 * q
-        last_points = (1.0 - f1) * p + f1 * q
-        pieces[straight] = shapely.linestrings(np.stack([first_points, last_points], axis=1))
-
+        ends = shapely.get_coordinates(lines[straight]).reshape(-1, 2, 2)  # [edge, start/end, x/y]
+        cut = shapely.get_coordinates(
+            shapely.line_interpolate_point(lines[straight], fraction[straight], normalized=True)
+        )
+        first[straight] = shapely.linestrings(np.stack([ends[:, 0], cut], axis=1))
+        second[straight] = shapely.linestrings(np.stack([cut, ends[:, 1]], axis=1))
     for i in np.flatnonzero(~straight):
-        pieces[i] = substring(geometry[i], start_fraction[i], stop_fraction[i], normalized=True)
-    return pieces
+        first[i] = substring(lines[i], 0.0, fraction[i], normalized=True)
+        second[i] = substring(lines[i], fraction[i], 1.0, normalized=True)
+    return first, second
 
 
-def _segments_frame(
-    edges: _EdgeArrays,
-    site_ids: np.ndarray,
-    pieces: _Pieces,
-    crs,
-) -> gpd.GeoDataFrame:
-    """One row per piece: site, edge, network-distance bounds, and geometry."""
-    length = edges.length[pieces.edge]
-    geometry = _cut_lines(
-        edges.geometry[pieces.edge], pieces.start / length, pieces.stop / length
-    )
+def _cut_edges(network: SpatialNetwork, winner: np.ndarray, dist: np.ndarray) -> gpd.GeoDataFrame:
+    """One row per positive-length piece of every reachable edge, sorted by edge and part.
+
+    The boundary position ``x`` on an edge of length ``L`` puts the edge in
+    one of three cases:
+
+    * ``x == L`` (the same winner at both ends, or the boundary at the v end):
+      the whole edge goes to the winner at u;
+    * ``x == 0`` (the boundary at the u end): the whole edge goes to the
+      winner at v;
+    * ``0 < x < L``: ``[0, x]`` goes to the winner at u (part 0) and
+      ``[x, L]`` to the winner at v (part 1).
+
+    Edges in a component without points are unreachable and get no piece.
+    """
+    edges = network.edges
+    u = edges["u"].to_numpy(np.int64)
+    v = edges["v"].to_numpy(np.int64)
+    L = edges["length"].to_numpy(float)
+    lines = edges.geometry.to_numpy()
+    wu, wv = winner[u], winner[v]
+    if np.any((wu < 0) != (wv < 0)):
+        raise RuntimeError("an edge joins reachable and unreachable nodes")
+    reachable = wu >= 0
+
+    # Boundary position on every edge; x = L unless the two winners differ.
+    x = L.copy()
+    differ = reachable & (wu != wv)
+    x[differ] = _edge_boundary(dist[u[differ]], dist[v[differ]], L[differ])
+    whole_to_u = reachable & (x == L)
+    whole_to_v = reachable & (x == 0.0)
+    split = reachable & (x > 0.0) & (x < L)
+
+    # The pieces come in three groups: whole edges, first parts of split
+    # edges, second parts of split edges. Each column below lists the three
+    # groups in that order.
+    whole = np.flatnonzero(whole_to_u | whole_to_v)
+    halves = np.flatnonzero(split)
+    first_part, second_part = _split_lines(lines[halves], x[halves] / L[halves])
+    n_whole, n_split = len(whole), len(halves)
+    piece_edge = np.concatenate([whole, halves, halves])
+    piece_part = np.concatenate([np.zeros(n_whole + n_split, dtype=int), np.ones(n_split, dtype=int)])
+    piece_rank = np.concatenate([np.where(whole_to_u[whole], wu[whole], wv[whole]), wu[halves], wv[halves]])
+    piece_start = np.concatenate([np.zeros(n_whole), np.zeros(n_split), x[halves]])
+    piece_stop = np.concatenate([L[whole], x[halves], L[halves]])
+    piece_geometry = np.concatenate([lines[whole], first_part, second_part])
+
+    order = np.lexsort((piece_part, piece_edge))  # by edge, then part 0 before part 1
+    clusters = network.cluster_ids
     return gpd.GeoDataFrame(
         {
-            "site_id": site_ids[pieces.site],
-            "edge_id": edges.edge_id[pieces.edge],
-            "from_dist": pieces.start,
-            "to_dist": pieces.stop,
-            "segment_dist": pieces.stop - pieces.start,
+            "cluster_id": clusters[piece_rank[order]].astype(str) if len(order) else np.asarray([], dtype=object),
+            "edge_id": edges["edge_id"].to_numpy()[piece_edge[order]],
+            "from_dist": piece_start[order],
+            "to_dist": piece_stop[order],
+            "segment_dist": piece_stop[order] - piece_start[order],
         },
+        geometry=gpd.GeoSeries(piece_geometry[order], crs=network.crs),
+        crs=network.crs,
+    )
+
+
+def _collect_cells(segments: gpd.GeoDataFrame, crs) -> gpd.GeoDataFrame:
+    """One row per cluster that owns network length, sorted by cluster ID.
+
+    The geometry is the cluster's single piece, or a MultiLineString of its
+    pieces in segment order. The pieces are collected, not merged with a
+    union, so that coincident edges of a custom network stay distinct.
+    """
+    if segments.empty:
+        return gpd.GeoDataFrame(columns=["cluster_id", "geometry"], geometry="geometry", crs=crs)
+    labels = segments["cluster_id"].to_numpy(dtype=object)
+    names, group = np.unique(labels, return_inverse=True)  # sorted IDs; group = position of each piece's ID
+    group = np.asarray(group).reshape(-1)
+    order = np.argsort(group, kind="stable")  # pieces grouped by cluster, segment order kept within a cluster
+    group, pieces = group[order], segments.geometry.to_numpy()[order]
+    first_piece = np.r_[True, group[1:] != group[:-1]]
+
+    # ``multilinestrings(pieces, indices=group)`` builds one MultiLineString
+    # per cluster from the pieces with that cluster's group number.
+    multi = shapely.multilinestrings(pieces, indices=group)
+    single = np.bincount(group) == 1
+    geometry = np.where(single, pieces[first_piece], multi)
+    return gpd.GeoDataFrame(
+        {"cluster_id": names.astype(str)},
         geometry=gpd.GeoSeries(geometry, crs=crs),
         crs=crs,
     )
 
 
-def _collect_cells(segments: gpd.GeoDataFrame, crs) -> gpd.GeoDataFrame:
-    """Collect each site's line pieces without topological union.
+def network_voronoi(network: SpatialNetwork) -> NetworkVoronoiResult:
+    """Partition every reachable positive-length network edge by cluster."""
+    dist, winner = _node_partition(network)
+    segments = _cut_edges(network, winner, dist)
+    cells = _collect_cells(segments, network.crs)
 
-    A unary union can collapse distinct graph edges that share the same map
-    coordinates (for example stacked links). ``MultiLineString`` keeps those
-    graph elements distinct, so the segment table remains faithfully additive.
-    """
-    if segments.empty:
-        return gpd.GeoDataFrame(columns=["site_id", "geometry"], geometry="geometry", crs=crs)
+    unreachable = np.flatnonzero(winner[network.edges["u"].to_numpy(np.int64)] < 0)
+    if len(unreachable):
+        unassigned_edges = network.edges.iloc[unreachable].copy().reset_index(drop=True)
+    else:
+        unassigned_edges = gpd.GeoDataFrame(
+            columns=network.edges.columns, geometry="geometry", crs=network.crs
+        )
 
-    # ``site_code[k]`` numbers the site of segment ``k``: 0 for the first site
-    # that appears in the table, 1 for the next new one, and so on.
-    site_code, site_id = pd.factorize(segments["site_id"])
-    # ``shapely.multilinestrings`` builds one MultiLineString per code and
-    # needs the codes in increasing order. A stable sort keeps each site's
-    # segments in their table order.
-    order = np.argsort(site_code, kind="stable")
-    cells = shapely.multilinestrings(
-        segments.geometry.to_numpy()[order], indices=site_code[order]
-    )
-    return gpd.GeoDataFrame(
-        {"site_id": site_id}, geometry=gpd.GeoSeries(cells, crs=crs), crs=crs
-    )
-
-
-def _unassigned_edges(network: SpatialNetwork, positions: np.ndarray) -> gpd.GeoDataFrame:
-    if len(positions):
-        return network.edges.iloc[positions].copy().reset_index(drop=True)
-    return gpd.GeoDataFrame(columns=network.edges.columns, geometry="geometry", crs=network.crs)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-
-def network_voronoi(
-    network: SpatialNetwork,
-    epsilon: float = 0.0,
-    batch_size: int = 32,
-) -> NetworkVoronoiResult:
-    """Construct hard and additive-epsilon Voronoi cells on a spatial network.
-
-    ``hard_segments`` assigns every reachable positive-length network portion
-    to one nearest site. Exact ties use the lexicographically smallest string
-    ``site_id``. ``epsilon_segments`` contains every site satisfying
-
-    ``d_N(site, x) <= min_h d_N(h, x) + epsilon``.
-
-    Therefore positive ``epsilon`` can produce overlapping cells. Isolated
-    zero-length membership points are not emitted as line features.
-
-    ``epsilon`` must be ``>= 0``; ``math.inf`` is allowed and makes every site
-    a member wherever it can reach. ``batch_size`` is the number of sites
-    whose shortest-path distances are held in memory at the same time
-    (``batch_size * number_of_nodes`` floats); it does not change the result.
-    """
-    # The two numbers are checked first because that is instant, while
-    # ``validate`` reads the whole network.
-    epsilon = _check_epsilon(epsilon)
-    batch_size = _check_batch_size(batch_size)
-    network.validate()
-
-    edges = _EdgeArrays.from_network(network)
-    site_ids = np.asarray([str(value) for value in network.site_ids.tolist()], dtype=object)
-
-    # 1. The nearest-site distance at every graph node.
-    min_dist = _minimum_node_distances(network)
-
-    # 2. One search per site: hard winners at nodes and epsilon pieces on edges.
-    winner, epsilon_pieces = _scan_sites(network, edges, site_ids, min_dist, epsilon, batch_size)
-
-    # 3. The endpoint winners and minima give the exact hard split of each edge.
-    hard_pieces, unassigned_positions = _hard_pieces(edges, min_dist, winner)
-
-    hard_segments = _segments_frame(edges, site_ids, hard_pieces, network.crs)
-    epsilon_segments = _segments_frame(edges, site_ids, epsilon_pieces, network.crs)
+    clusters = network.cluster_ids
+    node_cluster = np.full(len(winner), None, dtype=object)
+    node_cluster[winner >= 0] = [str(c) for c in clusters[winner[winner >= 0]]]
     return NetworkVoronoiResult(
-        hard_segments=hard_segments,
-        epsilon_segments=epsilon_segments,
-        hard_cells=_collect_cells(hard_segments, network.crs),
-        epsilon_cells=_collect_cells(epsilon_segments, network.crs),
-        unassigned_edges=_unassigned_edges(network, unassigned_positions),
-        node_min_distance=min_dist,
-        epsilon=epsilon,
+        segments=segments,
+        cells=cells,
+        unassigned_edges=unassigned_edges,
+        node_min_distance=dist,
+        node_cluster=node_cluster,
         distance_unit=network.distance_unit,
     )
