@@ -50,6 +50,9 @@
 
       <div class="nav-section">Rendering & implementation</div>
       <a href="#7-surface-rendering" data-nav-label="surface grid nearest network attachment approximate">7. 2-D surface</a>
+      <a href="#attachment-policies" data-nav-label="nearest reachable network attachment policies">Attachment policies</a>
+      <a href="#adaptive-refinement" data-nav-label="adaptive refinement convergence grid stability budget">Adaptive refinement</a>
+      <a href="#quality-and-publication" data-nav-label="territory evidence manifest transactional GeoPackage provenance">QA &amp; provenance</a>
       <a href="#8-fast-node-winners" data-nav-label="optimization candidate search tie candidates dijkstra">8. Fast node winners</a>
       <a href="#from-math-to-the-package" data-nav-label="Python API package pipeline">Package pipeline</a>
       <a href="#standard-vs-net-voronoi" data-nav-label="standard graph network Voronoi comparison">Standard vs net-voronoi</a>
@@ -61,7 +64,7 @@
     </nav>
 
     <div class="sidebar-footer">
-      <span>v0.2.0</span>
+      <span>main (unreleased)</span>
       <a href="https://github.com/miraflor/net-voronoi">View source</a>
     </div>
   </aside>
@@ -72,6 +75,9 @@
     <article class="doc-content" id="doc-content">
 
 <h1 id="how-net-voronoi-works">How <code>net-voronoi</code> works</h1>
+<p>This guide documents the current <code>main</code> branch. Adaptive rendering and transactional publication
+have been merged but have not received a separate tagged release; the package currently reports
+version <code>0.2.0</code>.</p>
 
 <p class="lede"><code>net-voronoi</code> partitions a spatial network among <strong>pre-existing point clusters</strong>.
 A network location belongs to the cluster whose nearest member point is closest by shortest-path
@@ -323,6 +329,75 @@ source point's own cluster covers that source point.</p>
   the surface samples that partition through nearest-network attachment.
 </div>
 
+<h3 id="attachment-policies">Which roads may receive a land attachment?</h3>
+
+<p>The default <code>attachment="nearest_network"</code> considers every road. If the nearest
+road belongs to a component without any source point, that land is reported as
+<code>surface_unassigned</code>. The alternative
+<code>attachment="nearest_reachable_network"</code> restricts attachment to roads on components
+containing at least one source point, so land can attach to a more distant reachable road.
+Neither policy changes road connectivity or the exact network Voronoi partition.</p>
+
+<p>When several road locations are equally near a representative point, the lowest
+<code>edge_id</code> in string order wins, and <code>anchor_ties</code> reports how many distinct
+locations were tied.</p>
+
+<h3 id="adaptive-refinement">Adaptive refinement and convergence</h3>
+
+<p><code>adaptive_surface_voronoi</code> computes the exact network partition once and reuses it
+while rendering successively finer grids. The initial requested spacing is coarsened if necessary
+to fit <code>max_cells</code>; the limit applies to <em>each</em> grid, not to the cumulative work.
+Each new spacing equals the previous spacing times <code>refine_factor</code> (default 0.5).
+The CLI enables this with <code>--adaptive</code> and uses <code>--resolution</code> as the starting spacing.</p>
+
+<p>Consecutive grids are compared by the fraction of boundary area whose owner changed,
+including the unassigned category. The default threshold is <code>0.005</code> (0.5%).
+Per-cluster intersection-over-union (IoU) is measured; a minimum may optionally be required.
+These comparisons measure <em>grid-to-grid stability</em>, not a certified error bound against
+an exact planar Voronoi surface.</p>
+
+<table>
+<thead><tr><th>Result status</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>converged</code></td><td>Two consecutive grids meet the selected changed-area and optional IoU criteria. By default no territory proven lost by the grid may remain.</td></tr>
+<tr><td><code>budget_limited</code></td><td>The next finer grid would exceed the configured cell budget.</td></tr>
+<tr><td><code>refinement_limit</code></td><td>The permitted number of refinements was exhausted.</td></tr>
+</tbody>
+</table>
+
+<p>The CLI is strict by default: an adaptive run that does not converge writes nothing.
+<code>--accept-nonconverged</code> explicitly permits publication of the finest valid grid
+with its actual status in the manifest. Python callers receive an
+<code>AdaptiveSurfaceResult</code> by default; <code>require_convergence=True</code> instead raises
+a <code>ConvergenceError</code> containing that result.</p>
+
+<pre><code class="language-powershell">netvoronoi build roads.gpkg clustered_points.parquet --cluster-col cluster_id --boundary boundary.gpkg --adaptive --resolution 100 --max-cells 1000000 --attachment nearest_reachable_network --output netvoronoi.gpkg</code></pre>
+
+<h3 id="quality-and-publication">Territory evidence, provenance and safe publication</h3>
+
+<p><code>surface_territory_qa</code> gives one row per cluster. A cluster may be
+<code>present</code>, <code>grid_lost</code>, <code>no_road_inside</code>,
+<code>shared_road_only</code> or <code>no_network_length</code>.
+Only <code>grid_lost</code> provides a geometric proof that positive-area land exists
+but the current grid did not capture it. A cluster whose roads are outside the study boundary
+can still own land <em>inside</em> it. The separate <code>territory_evidence</code> field
+keeps such inconclusive cases marked as <code>presence_undetermined</code>.
+A <code>converged</code> status does not certify completeness of all true planar territories.</p>
+
+<p>Every CLI GeoPackage includes a <code>netvoronoi_manifest</code> attribute table; CLI
+surface outputs also include <code>surface_territory_qa</code>. The manifest records
+software versions, input SHA-256 fingerprints, model settings, and (for adaptive runs)
+the refinement attempts, convergence measurements and status.</p>
+
+<p>Outputs are staged and checked for SQLite integrity, layers, row counts, fields and CRS
+before replacing an existing file. Input files are hashed before and after reading and
+immediately before publication; these are consistency checkpoints, not immutable snapshots.
+Publication rejects active destination SQLite sidecars and unsafe source/output aliasing.
+Before replacement, failures leave the old destination intact. After replacement,
+a directory-sync failure raises <code>PublicationDurabilityError(published=True)</code>
+because the new file has already been installed. On Windows the staged file is fsynced,
+but POSIX directory fsync is not available.</p>
+
 <h2 id="8-fast-node-winners">8. How the package gets node winners with few searches</h2>
 
 <p>The direct reference method is simple but can be expensive: run one shortest-path search per
@@ -366,7 +441,10 @@ is <strong>not</strong> the semantic tie rule.</p>
 </figure>
 
 <pre><code class="language-python">import geopandas as gpd
-from netvoronoi import from_geodataframes, network_voronoi, surface_voronoi
+from netvoronoi import (
+    ConvergencePolicy, adaptive_surface_voronoi,
+    from_geodataframes, network_voronoi, surface_voronoi,
+)
 
 roads = gpd.read_file("roads.gpkg", layer="roads")
 points = gpd.read_parquet("clustered_points.parquet")
@@ -383,14 +461,23 @@ network = from_geodataframes(
 exact = network_voronoi(network)
 exact.segments
 exact.cells
-exact.unassigned
+exact.unassigned_edges
 
 # Optional 2-D rendering:
 boundary = gpd.read_file("boundary.gpkg", layer="boundary")
 surface = surface_voronoi(network, boundary, resolution=100)
 surface.cells
 surface.grid
-surface.point_qa</code></pre>
+surface.point_qa
+
+# Optional adaptive rendering; non-convergence is returned as a status
+# by default in Python, rather than silently treated as success.
+adaptive = adaptive_surface_voronoi(
+    network, boundary, start_resolution=100,
+    convergence=ConvergencePolicy(global_changed_area_max=0.005),
+)
+print(adaptive.status, adaptive.selected_resolution)
+print(adaptive.territories[["cluster_id", "territory_status", "territory_evidence"]].head())</code></pre>
 
 <pre><code class="language-text">road lines + clustered points
         ↓
@@ -403,8 +490,10 @@ nearest-cluster field D(v) + deterministic node winners
 closed-form boundary on each site-free edge
         ↓
 network_segments  →  network_cells
-        ↓ optional nearest-network attachment on a grid
-surface_cells + surface_grid_debug + surface_point_qa</code></pre>
+        ↓ optional fixed or adaptive grid rendering
+surface_cells + surface_grid_debug + surface_point_qa
+        ↓ CLI: transactional GeoPackage publication
+surface_territory_qa + netvoronoi_manifest</code></pre>
 
 <h2 id="standard-vs-net-voronoi">What is standard network Voronoi and what is specific to <code>net-voronoi</code>?</h2>
 
