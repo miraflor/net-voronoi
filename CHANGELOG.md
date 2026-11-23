@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-### v3 hardening (proposed)
+### Documentation alignment
+
+- Synchronize the README, mathematical design notes and visual guide with the merged adaptive rendering, territory evidence, provenance and transactional publication APIs.
+- Correct the visual guide's exact network result field to `unassigned_edges` and clarify the difference between pre-replacement and post-replacement failures.
+- Keep the package version at `0.2.0` until a separate versioned release.
+
+### Adaptive surface rendering and v3 hardening (merged into `main` via PR #1)
 
 - Convergence comparisons reject different geographic domains, different CRSs and different attachment policies. Internal comparisons reuse the stored clipping boundary without reconstructing an expensive grid union.
 - Territory QA reports `territory_evidence`: `no_road_inside` and `shared_road_only` are *undetermined*, not proofs of absent land. Adaptive manifests distinguish grid-to-grid stability from exact territory completeness.
@@ -11,7 +17,7 @@
 - Existing fixed-rendering geometry, network ownership and tie rules are unchanged.
 
 
-Additions only: existing calls give the same results and write the same layers; CLI outputs gain two tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces).
+**Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata remains at version `0.2.0` until a new release is cut.
 
 - **Transactional GeoPackage output.** All layers are written to a temporary file in the target's folder, read back and checked (SQLite integrity and foreign keys, layer names, row counts, column names, CRS), flushed, and then moved onto the target with one `os.replace`. Before, `--force` deleted the old file first, so a failure in a later layer lost the previous output. The flush uses a read-write handle because Windows cannot flush a read-only one.
 - **`netvoronoi_manifest`** in every CLI output: a table without geometry holding one JSON text with software versions, input files (size and SHA-256), network size and CRS, tie rules and surface settings.

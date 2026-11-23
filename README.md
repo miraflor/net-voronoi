@@ -6,6 +6,8 @@ Input points already have cluster labels. The package does not create clusters a
 
 There is **no additive tolerance / epsilon Voronoi mode**. Cells are exclusive in positive network length.
 
+The [visual algorithm guide](docs/index.html) illustrates the exact lineal construction. This README documents the current `main` branch, including adaptive features not yet included in a new tagged release.
+
 ## Method
 
 ### Distance from a location to a cluster
@@ -76,7 +78,7 @@ Every file written by the CLI also contains `netvoronoi_manifest`, a table witho
 
 A layer with no rows is not written. For example, when every road component contains a point, the file has no `network_unassigned` layer. Treat a missing layer as an empty one.
 
-The file is written as one transaction: all layers go to a temporary file in the same folder, which is read back and checked before it replaces the target in one step. A failure at any point leaves an existing output unchanged, also with `--force`.
+The file is written as one transaction: all layers go to a temporary file in the same folder, which is read back and checked before it replaces the target in one step. A failure **before** the atomic replacement leaves an existing output unchanged, including with `--force`. A failure **after** replacement, such as a POSIX directory-sync error, raises `PublicationDurabilityError(published=True)`: the new file has already replaced the old one, and crash durability is unconfirmed. The staged file is fsynced first, but cross-platform crash durability is not guaranteed.
 
 ### Which roads land attaches to
 
@@ -134,7 +136,7 @@ The comparison is the share of land whose owner changed: $`1 - \sum_k \mathrm{ar
 
 The run stops with one of three statuses:
 
-- `converged`: the last two grids changed at most `--changed-area-max` of the land (default 0.005), every cluster that the grid had lost reappeared, and, if `--min-cluster-iou` is given, every cluster reached that IoU;
+- `converged`: the last two grids changed at most `--changed-area-max` of the land (default 0.005), no cluster classified as `grid_lost` remains **under the default policy** (this condition can be disabled with `--allow-missing-territories`), and, if `--min-cluster-iou` is given, every cluster met that IoU;
 - `budget_limited`: the next grid would exceed `--max-cells`;
 - `refinement_limit`: `--max-refinements` finer grids (default 5) were tried.
 
@@ -142,9 +144,17 @@ One grid alone is never `converged`. If the first spacing needs more than `--max
 
 By default the CLI writes an adaptive result only when it is `converged`; otherwise it writes nothing, reports the measurements, and exits with code 1. `--accept-nonconverged` writes the finest grid anyway, records that decision in the manifest, and says on screen that the surface is not verified as converged.
 
-Expect `budget_limited` on city-sized inputs. On a synthetic 15 km × 15 km road grid with 100 m blocks and 1,500 clusters, the share of land that changed owner was 24 % between 100 m and 50 m, 7 % between 50 m and 25 m, and 4.5 % between 25 m and 12.5 m; 0.5 % would need a spacing of a few metres. The measured share is then the useful result: it estimates how much land still depends on the grid. `converged` means that two grids agreed within the setting, not that the polygons are exact.
+Expect `budget_limited` on city-sized inputs. On a synthetic 15 km × 15 km road grid with 100 m blocks and 1,500 clusters, the share of land that changed owner was 24 % between 100 m and 50 m, 7 % between 50 m and 25 m, and 4.5 % between 25 m and 12.5 m; 0.5 % would need a spacing of a few metres. The measured share quantifies disagreement **between the two tested grids**; it does not bound the error against the unknown exact planar surface or predict disagreements at still finer spacings. `converged` means that two grids agreed within the policy, not that the polygons are exact.
 
-`surface_territory_qa` explains clusters without land. `grid_lost` means the cluster owns road inside the boundary that no other owner's road covers, so it has land and a finer grid recovers it. `no_road_inside` (its road lies outside the boundary, common when the road network extends beyond the study area), `shared_road_only` and `no_network_length` are reported but do not block convergence. Section 12 of `DESIGN.md` gives the reasoning.
+`surface_territory_qa` explains clusters without land. `grid_lost` means the cluster owns road inside the boundary that no other owner's road covers, so it has land and a finer grid recovers it. `no_road_inside` (its road lies outside the boundary, common when the network extends beyond the study area), `shared_road_only` and `no_network_length` are reported but do not block convergence. The separate `territory_evidence` column marks `no_road_inside` and `shared_road_only` as `presence_undetermined`: lack of a road inside the boundary is **not** proof of no land there. Section 12 of `DESIGN.md` gives the reasoning.
+
+## Publication and reproducibility
+
+The CLI takes SHA-256 snapshots of each input **before reading it, immediately after reading it, and immediately before replacing the output**. Directory datasets are hashed by their member paths and contents. Changed inputs, source/output path aliasing, symlinks in input datasets, and destination SQLite `-wal`, `-shm` or `-journal` files stop publication. These checkpoints detect changes; they are not immutable snapshots and cannot eliminate every concurrent modification race.
+
+Each staged GeoPackage undergoes SQLite integrity and foreign-key checks, plus verification of layer names, row counts, field names and CRS before publication. Attribute tables such as `netvoronoi_manifest` and `surface_territory_qa` are included in the transaction and are visible to GeoPackage-aware applications. The CLI writes these tables automatically; direct Python calls to the writers require callers to supply the optional `manifest` and `territories` arguments.
+
+If a run fails **after** `os.replace`, the new output may already be present. The typed `PublicationDurabilityError` explicitly marks `published=True`; inspect the destination instead of assuming the old file survived. On Windows, the package fsyncs the staged file but does not perform POSIX directory fsync. See [DESIGN.md, sections 13–15](DESIGN.md#13-transactional-output) for the full failure contract.
 
 ## Install
 
@@ -227,6 +237,7 @@ network = from_geodataframes(
 
 # Exact network partition only:
 exact = network_voronoi(network)
+print(exact.segments, exact.cells, exact.unassigned_edges)
 
 # Or, with the 2-D surface. surface_voronoi computes the exact network
 # partition itself; it is available as surface.network.
@@ -277,7 +288,9 @@ Measured on one machine with a regular grid of roads with 50 m spacing and rando
 
 The slowest case for `network_voronoi` is when exact ties are everywhere (for example, all points on grid nodes): every cluster then needs its own shortest-path search. With about 1,000,000 edges and 5,000 clusters this took about 23 s.
 
-## Scope of v0.2.0
+## Scope of current `main` (unreleased additions since v0.2.0)
+
+Adaptive rendering, the attachment selector, provenance and transactional output are merged into `main`, but the package metadata and latest tagged release still report `0.2.0`. These additions have not yet received their own versioned release.
 
 Supported: projected undirected simple line networks, geometric edge length as impedance, LineString/MultiLineString road data, clustered point input, exact insertion of snapped points, multi-source shortest paths by cluster, disconnected components, deterministic ties, transactional GeoPackage output with an embedded manifest, optional Parquet input (with `netvoronoi[parquet]`), and optional grid-rendered polygon cells with two attachment policies and adaptive grid spacing.
 
