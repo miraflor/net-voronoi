@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### v3 hardening (proposed)
+
+- Convergence comparisons reject different geographic domains, different CRSs and different attachment policies. Internal comparisons reuse the stored clipping boundary without reconstructing an expensive grid union.
+- Territory QA reports `territory_evidence`: `no_road_inside` and `shared_road_only` are *undetermined*, not proofs of absent land. Adaptive manifests distinguish grid-to-grid stability from exact territory completeness.
+- CLI snapshots input files and directory datasets by SHA-256 before reading, checks them after reading, and checks again immediately before output replacement. It refuses to overwrite a source dataset.
+- Transactional publication rejects destination WAL/journal sidecars and symlink targets, and reports a post-replacement directory-sync failure as `PublicationDurabilityError(published=True)` rather than silently ignoring it.
+- Existing fixed-rendering geometry, network ownership and tie rules are unchanged.
+
+
+Additions only: existing calls give the same results and write the same layers; CLI outputs gain two tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces).
+
+- **Transactional GeoPackage output.** All layers are written to a temporary file in the target's folder, read back and checked (SQLite integrity and foreign keys, layer names, row counts, column names, CRS), flushed, and then moved onto the target with one `os.replace`. Before, `--force` deleted the old file first, so a failure in a later layer lost the previous output. The flush uses a read-write handle because Windows cannot flush a read-only one.
+- **`netvoronoi_manifest`** in every CLI output: a table without geometry holding one JSON text with software versions, input files (size and SHA-256), network size and CRS, tie rules and surface settings.
+- **`attachment=` / `--attachment`** for the 2-D surface: `nearest_network` (default, the previous behaviour) or `nearest_reachable_network` (land attaches only to roads on components that contain a point). The exact network partition and the `edge_id` tie rule are the same under both.
+- **`adaptive_surface_voronoi` / `--adaptive`**: renders finer and finer grids under a per-grid `max_cells` budget, computes the exact network partition once, compares consecutive grids by the share of land that changed owner and by per-cluster IoU, and stops with `converged`, `budget_limited` or `refinement_limit`. A too-fine first spacing is coarsened to the finest one that fits, without building a grid. The CLI writes a non-converged result only with `--accept-nonconverged`.
+- **`territory_qa` and `surface_territory_qa`**: one row per cluster, separating clusters lost only by the grid (`grid_lost`, provably recoverable) from clusters whose road lies outside the boundary or is shared, and from clusters without network length.
+- **CLI option checks before reading input**: options that need `--adaptive` or `--boundary` are refused first.
+- `SurfaceVoronoiResult` gains `resolution` and `attachment` fields with defaults; the five existing fields are unchanged.
+
 ## 0.2.0 - 2026-09-30
 
 Clean replacement of the previous `net-voronoi` implementation.

@@ -9,15 +9,31 @@ an approximation whose detail is set by ``resolution``.
 Reading order:
 
 1. ``surface_voronoi`` checks the inputs, computes the exact network
-   partition, and runs the steps below;
-2. ``_grid`` cuts the boundary into square cells and gives one
+   partition, chooses the roads that land may attach to
+   (``_attachment_edges``), and calls ``_render``;
+2. ``_render`` runs the steps below for one grid spacing. It does not
+   compute any shortest path: it receives the exact network result, so the
+   adaptive renderer in ``adaptive.py`` can call it for several spacings
+   with one network computation;
+3. ``_grid`` cuts the boundary into square cells and gives one
    representative point per cell;
-3. ``_anchor_edges`` attaches each representative point to its nearest
-   network location (the anchor);
-4. ``_assign_anchors`` gives each anchor the exact network cluster at that
+4. ``_anchor_edges`` attaches each representative point to its nearest
+   allowed network location (the anchor);
+5. ``_assign_anchors`` gives each anchor the exact network cluster at that
    location, using ``_edge_boundary`` from ``core.py``;
-5. the cells are dissolved by cluster, and ``_point_qa`` checks that every
+6. the cells are dissolved by cluster, and ``_point_qa`` checks that every
    input point lies in the polygon of its own cluster.
+
+Two attachment policies decide which roads land may attach to:
+
+* ``"nearest_network"`` (the default, and the only behaviour before this
+  option existed): every road. Land whose nearest road lies on a component
+  without any point stays unassigned, because that road has no owner.
+* ``"nearest_reachable_network"``: only roads on components that contain
+  at least one point. Land then attaches to the nearest road that has an
+  owner, even when a road without an owner is nearer. This is a different
+  model of the land, not a change of the network: no road is connected to
+  another, and the exact network partition is the same under both policies.
 """
 
 from __future__ import annotations
@@ -34,17 +50,31 @@ from .model import SpatialNetwork
 
 DEFAULT_MAX_CELLS = 1_000_000
 
+ATTACHMENT_POLICIES = ("nearest_network", "nearest_reachable_network")
+
 _POLYGON = 3  # Shapely geometry type ids
 _MULTIPOLYGON = 6
 
 
 @dataclass(frozen=True)
 class SurfaceVoronoiResult:
+    """One grid rendering of the nearest-network attachment model.
+
+    ``resolution`` and ``attachment`` record how the rendering was made. They
+    were added after the first five fields and have defaults, so code that
+    builds this object with five positional arguments still works.
+    """
+
     cells: gpd.GeoDataFrame
     grid: gpd.GeoDataFrame
     unassigned: gpd.GeoDataFrame
     point_qa: gpd.GeoDataFrame
     network: NetworkVoronoiResult
+    resolution: float | None = None
+    attachment: str = "nearest_network"
+    # The exact clipping domain, shared by every refinement. Optional so
+    # callers constructing older five-field results keep working.
+    domain_geometry: object | None = None
 
 
 # ------------------------------------------------------------ input checks
@@ -94,6 +124,13 @@ def _validate_resolution(resolution: float) -> float:
     if not np.isfinite(resolution) or resolution <= 0:
         raise ValueError("resolution must be finite and positive")
     return resolution
+
+
+def _check_attachment(attachment: str) -> str:
+    """``attachment`` unchanged, after checking that it names a known policy."""
+    if attachment not in ATTACHMENT_POLICIES:
+        raise ValueError(f"attachment must be one of {', '.join(ATTACHMENT_POLICIES)}; got {attachment!r}")
+    return attachment
 
 
 def _grid_shape(boundary, resolution: float) -> tuple[int, int]:
@@ -169,13 +206,73 @@ def _grid(boundary, resolution: float) -> tuple[np.ndarray, np.ndarray]:
 # --------------------------------------------------------------- 3. anchors
 
 
-def _anchor_edges(network: SpatialNetwork, points: np.ndarray):
-    """Nearest network edge and position on it for every representative point.
+def _attachment_edges(network: SpatialNetwork, result: NetworkVoronoiResult, attachment: str) -> np.ndarray:
+    """Positions in ``network.edges`` of the roads that land may attach to.
+
+    ``"nearest_network"`` allows every edge. ``"nearest_reachable_network"``
+    allows only edges whose end nodes have a finite distance to some point,
+    which are the edges on components that contain a point. On an undirected
+    network both ends of an edge are reachable or neither is; ``core._cut_edges``
+    already stops with an error otherwise, so one end is enough here.
+    """
+    attachment = _check_attachment(attachment)
+    if attachment == "nearest_network":
+        return np.arange(len(network.edges), dtype=np.int64)
+    u = network.edges["u"].to_numpy(np.int64)
+    allowed = np.flatnonzero(np.isfinite(result.node_min_distance[u])).astype(np.int64)
+    if len(allowed) == 0:
+        # Not reachable with a network built by ``from_geodataframes``, which
+        # always places points on roads; kept as a clear message for custom
+        # networks instead of an empty spatial index.
+        raise ValueError("nearest_reachable_network needs at least one edge on a component with a point")
+    return allowed
+
+
+@dataclass(frozen=True)
+class _AnchorIndex:
+    """A spatial index over the roads that land may attach to.
+
+    ``edge`` holds the positions in ``network.edges`` of the indexed roads;
+    the index returns positions into ``edge``, which ``_anchor_edges`` maps
+    back to ``network.edges``. ``id_rank`` is the string-order rank of every
+    ``edge_id`` in the whole edge table. Ranking the whole table, not only the
+    indexed roads, keeps the tie rule identical under both attachment
+    policies: the smaller ``edge_id`` wins either way.
+
+    Building the index once and reusing it saves rebuilding it for every grid
+    spacing in ``adaptive.py``.
+    """
+
+    edge: np.ndarray
+    tree: shapely.STRtree
+    id_rank: np.ndarray
+
+
+def _anchor_index(network: SpatialNetwork, edge: np.ndarray | None = None) -> _AnchorIndex:
+    """Build the ``_AnchorIndex`` over ``edge`` (default: every edge)."""
+    edges = network.edges
+    if edge is None:
+        edge = np.arange(len(edges), dtype=np.int64)
+    edge_ids = edges["edge_id"].astype(str).to_numpy()
+    id_rank = np.empty(len(edge_ids), dtype=np.int64)
+    id_rank[np.argsort(edge_ids, kind="stable")] = np.arange(len(edge_ids))
+    return _AnchorIndex(
+        edge=np.asarray(edge, dtype=np.int64),
+        tree=shapely.STRtree(edges.geometry.to_numpy()[edge]),
+        id_rank=id_rank,
+    )
+
+
+def _anchor_edges(network: SpatialNetwork, points: np.ndarray, index: _AnchorIndex | None = None):
+    """Nearest allowed network edge and position on it for every representative point.
 
     Returns ``(edge, offset, access, ties)``: the edge position in
     ``network.edges``, the network distance from the edge's ``u`` end to the
     anchor, the straight-line distance from the point to the anchor, and the
     number of distinct network locations at that nearest distance.
+
+    ``index`` limits the search to the roads land may attach to; without it,
+    every edge is searched (the ``"nearest_network"`` policy).
 
     When several edges are exactly equally near, the one with the smallest
     ``edge_id`` (string order) is used. An offset within the numerical
@@ -183,21 +280,20 @@ def _anchor_edges(network: SpatialNetwork, points: np.ndarray):
     snapping. Edges that meet at the nearest node offer one location (that
     node), so a point next to a junction is not counted as ambiguous.
     """
+    if index is None:
+        index = _anchor_index(network)
     edges = network.edges
     lines = edges.geometry.to_numpy()
     # ``query_nearest`` returns all equally near edges as (point, edge) index
     # pairs with their distances. A point with two nearest edges appears in
-    # two pairs.
-    (pidx, eidx), distance = shapely.STRtree(lines).query_nearest(
-        points, all_matches=True, return_distance=True
-    )
+    # two pairs. The tree numbers its roads 0, 1, 2, ...; ``index.edge`` turns
+    # those numbers into positions in ``network.edges``.
+    (pidx, tree_pos), distance = index.tree.query_nearest(points, all_matches=True, return_distance=True)
+    eidx = index.edge[tree_pos]
     # Sort the pairs by point and then by the string order of edge_id, so that
     # the first pair of each point holds the nearest edge with the smallest
     # edge_id.
-    edge_ids = edges["edge_id"].astype(str).to_numpy()
-    id_rank = np.empty(len(edge_ids), dtype=np.int64)
-    id_rank[np.argsort(edge_ids, kind="stable")] = np.arange(len(edge_ids))
-    order = np.lexsort((id_rank[eidx], pidx))
+    order = np.lexsort((index.id_rank[eidx], pidx))
     pidx, eidx, distance = pidx[order], eidx[order], distance[order]
     first = np.r_[True, pidx[1:] != pidx[:-1]]
     if first.sum() != len(points):
@@ -300,22 +396,45 @@ def surface_voronoi(
     *,
     resolution: float = 100.0,
     max_cells: int | None = DEFAULT_MAX_CELLS,
+    attachment: str = "nearest_network",
 ) -> SurfaceVoronoiResult:
     """Render cluster cells over a polygon using nearest-network attachment.
 
     This is a grid approximation of a defined 2-D access model: each grid-cell
-    representative point attaches to its nearest location on the road network
-    and inherits that location's exact network Voronoi cluster.
+    representative point attaches to its nearest allowed location on the road
+    network and inherits that location's exact network Voronoi cluster.
+    ``attachment`` chooses the allowed roads (see the module docstring); the
+    default gives the same result as before the option existed.
     """
     resolution = _validate_resolution(resolution)
+    attachment = _check_attachment(attachment)
     boundary_geom = _boundary_geometry(boundary, network.crs)
     check_grid_size(boundary_geom, network.crs, resolution, max_cells)
     net = network_voronoi(network)
+    index = _anchor_index(network, _attachment_edges(network, net, attachment))
+    return _render(network, net, boundary_geom, resolution, index, attachment)
+
+
+def _render(
+    network: SpatialNetwork,
+    net: NetworkVoronoiResult,
+    boundary_geom,
+    resolution: float,
+    index: _AnchorIndex,
+    attachment: str,
+) -> SurfaceVoronoiResult:
+    """One grid rendering, steps 3 to 6 of the module docstring.
+
+    The inputs are already checked: ``boundary_geom`` comes from
+    ``_boundary_geometry``, the grid size from ``check_grid_size`` (or the
+    planner in ``adaptive.py``), and ``net`` is ``network_voronoi(network)``.
+    Nothing here computes a shortest path.
+    """
     cells, reps = _grid(boundary_geom, resolution)
     if len(cells) == 0:
         raise ValueError("boundary produced no positive-area grid cells")
 
-    edge, offset, access, anchor_ties = _anchor_edges(network, reps)
+    edge, offset, access, anchor_ties = _anchor_edges(network, reps, index)
     assigned = _assign_anchors(network, net, edge, offset)
     edge_id = network.edges["edge_id"].to_numpy()[edge]
 
@@ -351,4 +470,7 @@ def surface_voronoi(
         unassigned=unassigned,
         point_qa=_point_qa(network, surface),
         network=net,
+        resolution=resolution,
+        attachment=attachment,
+        domain_geometry=boundary_geom,
     )

@@ -57,7 +57,8 @@ With a polygon boundary, `net-voronoi` can also render an approximate 2-D surfac
 - `surface_cells` — grid cells dissolved by cluster;
 - `surface_grid_debug` — the underlying grid assignment and nearest-network anchor QA;
 - `surface_unassigned` — cells whose nearest network component has no clustered point;
-- `surface_point_qa` — whether each source point is covered by the rendered polygon for its own cluster.
+- `surface_point_qa` — whether each source point is covered by the rendered polygon for its own cluster;
+- `surface_territory_qa` (a table without geometry) — one row per cluster: its network length, the part of it inside the boundary, its land and grid cells, and why land is missing where it is (see [Choosing the grid spacing](#choosing-the-grid-spacing)).
 
 The 2-D layer uses a clear attachment model: each grid-cell representative point attaches to its nearest location on the network and inherits that network location's exact cluster. If several distinct network locations are exactly equally near, the location on the lexicographically smallest string `edge_id` is used and `anchor_ties` records the ambiguity. Finer `--resolution` values give a finer surface approximation.
 
@@ -71,7 +72,20 @@ where $`N`$ is the set of all locations on the network, $`\lVert g - z \rVert`$ 
 
 The GeoPackage also contains the inputs as used: `network_edges`, `points_input`, `points_snapped`, and `snap_connectors` (a straight line from each input point to its snapped node).
 
+Every file written by the CLI also contains `netvoronoi_manifest`, a table without geometry with one JSON text: software versions, input files (size and SHA-256), network size and CRS, tie rules, and for a surface the attachment policy, the spacing and, for an adaptive run, every grid tried and the final status.
+
 A layer with no rows is not written. For example, when every road component contains a point, the file has no `network_unassigned` layer. Treat a missing layer as an empty one.
+
+The file is written as one transaction: all layers go to a temporary file in the same folder, which is read back and checked before it replaces the target in one step. A failure at any point leaves an existing output unchanged, also with `--force`.
+
+### Which roads land attaches to
+
+`--attachment` (Python: `attachment=`) chooses the roads that land may attach to:
+
+- `nearest_network` (default): the nearest road of any component. Land whose nearest road is on a component without points is unassigned (`surface_unassigned`).
+- `nearest_reachable_network`: the nearest road on a component that contains a point. All land then has an owner. The two components are not connected by this; land near a road without points simply attaches to a farther road that has an owner.
+
+The exact network partition is the same under both rules.
 
 ## Why the point clusters are preserved
 
@@ -111,6 +125,26 @@ In symbols, two distances $`a`$ and $`b`$ are treated as equal when
 ```
 
 For example, two distances of about 1,000,000 m are equal when they differ by at most $`10^{-6}`$ m, and two distances of about 10 m when they differ by at most $`10^{-9}`$ m.
+
+## Choosing the grid spacing
+
+A grid can move a border between two clusters by about one cell and can miss land narrower than a cell. With `--adaptive` (Python: `adaptive_surface_voronoi`), the surface is rendered on finer and finer grids, starting from `--resolution` and multiplying the spacing by `--refine-factor` (default 0.5), and each grid is compared with the one before it. The exact network partition is computed once for all grids.
+
+The comparison is the share of land whose owner changed: $`1 - \sum_k \mathrm{area}(A_k \cap B_k) / \mathrm{area}(\text{boundary})`$, where $`A_k`$ and $`B_k`$ are the land of cluster $`k`$ (or of the unassigned category) in the two grids. Per cluster, the overlap $`\mathrm{IoU} = \mathrm{area}(A \cap B) / \mathrm{area}(A \cup B)`$ is reported.
+
+The run stops with one of three statuses:
+
+- `converged`: the last two grids changed at most `--changed-area-max` of the land (default 0.005), every cluster that the grid had lost reappeared, and, if `--min-cluster-iou` is given, every cluster reached that IoU;
+- `budget_limited`: the next grid would exceed `--max-cells`;
+- `refinement_limit`: `--max-refinements` finer grids (default 5) were tried.
+
+One grid alone is never `converged`. If the first spacing needs more than `--max-cells` squares, the finest spacing that fits is used, found by counting squares without building a grid. The result is always the finest grid tried.
+
+By default the CLI writes an adaptive result only when it is `converged`; otherwise it writes nothing, reports the measurements, and exits with code 1. `--accept-nonconverged` writes the finest grid anyway, records that decision in the manifest, and says on screen that the surface is not verified as converged.
+
+Expect `budget_limited` on city-sized inputs. On a synthetic 15 km × 15 km road grid with 100 m blocks and 1,500 clusters, the share of land that changed owner was 24 % between 100 m and 50 m, 7 % between 50 m and 25 m, and 4.5 % between 25 m and 12.5 m; 0.5 % would need a spacing of a few metres. The measured share is then the useful result: it estimates how much land still depends on the grid. `converged` means that two grids agreed within the setting, not that the polygons are exact.
+
+`surface_territory_qa` explains clusters without land. `grid_lost` means the cluster owns road inside the boundary that no other owner's road covers, so it has land and a finer grid recovers it. `no_road_inside` (its road lies outside the boundary, common when the road network extends beyond the study area), `shared_road_only` and `no_network_length` are reported but do not block convergence. Section 12 of `DESIGN.md` gives the reasoning.
 
 ## Install
 
@@ -155,6 +189,22 @@ netvoronoi build `
   --output "output\netvoronoi.gpkg"
 ```
 
+Adaptive spacing, with land attached only to roads that a point can reach:
+
+```powershell
+netvoronoi build `
+  "data\roads.gpkg" `
+  "data\clustered_points.parquet" `
+  --cluster-col cluster_id `
+  --boundary "data\boundary.gpkg" `
+  --resolution 100 `
+  --adaptive `
+  --attachment nearest_reachable_network `
+  --output "output\netvoronoi.gpkg"
+```
+
+Options that only apply to `--adaptive` (`--refine-factor`, `--max-refinements`, `--changed-area-max`, `--min-cluster-iou`, `--allow-missing-territories`, `--accept-nonconverged`) are refused without it, and `--adaptive` and `--attachment` are refused without `--boundary`, before any input file is read.
+
 Files ending in `.parquet` or `.geoparquet` are read with `geopandas.read_parquet`; all other files with `geopandas.read_file`. Re-running against an existing output requires `--force`. Input problems (a missing column, a point too far from the roads, an existing output file) are reported as one `Error: ...` line with exit code 1.
 
 ## Python API
@@ -182,7 +232,23 @@ exact = network_voronoi(network)
 # partition itself; it is available as surface.network.
 surface = surface_voronoi(network, boundary, resolution=100)
 exact = surface.network
+
+# Or let the grid spacing be refined until two grids agree.
+from netvoronoi import ConvergencePolicy, adaptive_surface_voronoi
+
+result = adaptive_surface_voronoi(
+    network,
+    boundary,
+    start_resolution=100,
+    max_cells=1_000_000,
+    convergence=ConvergencePolicy(global_changed_area_max=0.005),
+)
+print(result.status, result.selected_resolution)  # e.g. "budget_limited 12.5"
+surface = result.surface                         # the finest grid tried
+print(result.territories.territory_status.value_counts())
 ```
+
+With `require_convergence=True`, a run that does not converge raises `ConvergenceError`; its `result` attribute holds the same measurements.
 
 ## Code map
 
@@ -191,9 +257,10 @@ The modules, in reading order:
 1. `src/netvoronoi/network.py` — builds a `SpatialNetwork` from road lines and points: road segments, shared vertices, snapping, point insertion;
 2. `src/netvoronoi/model.py` — the `SpatialNetwork` data contract and its validation;
 3. `src/netvoronoi/core.py` — the exact partition: winners at nodes, the one per-edge boundary formula (`_edge_boundary`), and the cut pieces;
-4. `src/netvoronoi/surface.py` — the approximate 2-D rendering on a grid;
-5. `src/netvoronoi/io.py` and `src/netvoronoi/cli.py` — GeoPackage output and the command line;
-6. `src/netvoronoi/_numeric.py` — the shared tolerance rule and two array helpers.
+4. `src/netvoronoi/surface.py` — the approximate 2-D rendering on a grid, and the two attachment policies;
+5. `src/netvoronoi/adaptive.py` — refinement of the grid spacing, the comparison between grids, and the territory table;
+6. `src/netvoronoi/io.py` and `src/netvoronoi/cli.py` — transactional GeoPackage output and the command line;
+7. `src/netvoronoi/_numeric.py` — the shared tolerance rule and two array helpers.
 
 `DESIGN.md` explains the method and the reasons behind it.
 
@@ -212,7 +279,7 @@ The slowest case for `network_voronoi` is when exact ties are everywhere (for ex
 
 ## Scope of v0.2.0
 
-Supported: projected undirected simple line networks, geometric edge length as impedance, LineString/MultiLineString road data, clustered point input, exact insertion of snapped points, multi-source shortest paths by cluster, disconnected components, deterministic ties, GeoPackage output, optional Parquet input (with `netvoronoi[parquet]`), and optional grid-rendered polygon cells.
+Supported: projected undirected simple line networks, geometric edge length as impedance, LineString/MultiLineString road data, clustered point input, exact insertion of snapped points, multi-source shortest paths by cluster, disconnected components, deterministic ties, transactional GeoPackage output with an embedded manifest, optional Parquet input (with `netvoronoi[parquet]`), and optional grid-rendered polygon cells with two attachment policies and adaptive grid spacing.
 
 Not yet supported: directed/one-way routing, turn restrictions, arbitrary travel-time impedance, polygon cells that are mathematically exact off-network, or automatic repair of uncertain road topology.
 
@@ -232,6 +299,7 @@ The cluster rule reduces to the ordinary diagram of the points. At every locatio
 | Exact boundary inside an edge, $`x^* = (D(v) + L - D(u))/2`$ | Follows from the distance along an edge, $`\min(D(u) + x,\ D(v) + L - x)`$, which is the edge function of network location theory (Hakimi, 1964) and of the network Voronoi partition (Hakimi et al., 1992; Okabe et al., 2008). |
 | Snapped points inserted as graph nodes, splitting the edge | Points moved to the nearest road segment, with the segment split at that location (Wang et al., 2019); objects located on network edges (Yiu and Mamoulis, 2004). |
 | 2-D surface | A rendering step, not a Voronoi construction: each grid cell takes the exact network result at its nearest network location, and the result is labeled as an approximation. |
+| Adaptive grid spacing | Engineering, not a Voronoi construction: the same rendering repeated at finer spacings with a stated stopping rule. The `grid_lost` classification rests only on roads being closed sets (`DESIGN.md`, section 12). |
 
 ### What is specific to this package
 
