@@ -91,3 +91,68 @@ When exact ties are rare, which is usual for roads with measured coordinates, th
 Floating-point distances and positions are compared with `_numeric._tol`: two numbers of magnitude up to `m` are treated as equal when they differ by at most `max(1e-9, 1e-12 × m)`. The relative part grows with the numbers compared, because a number of magnitude `m` is stored with a relative error of about `1e-16`, and sums of many such numbers collect more error.
 
 At nodes, the final equality test is local: `D_c(v)` and `D(v)` are compared with `_tol(D_c(v), D(v))`. Section 8 still uses one conservative network-wide value `T = _tol(largest finite D)` for candidate discovery only. `T` is a superset bound, not the semantic tie rule.
+
+## 10. Attachment policies for the 2-D surface
+
+The exact network result gives owners only to locations on roads that a point can reach. Land needs one more rule: which road a land point attaches to. Two rules are offered, and the chosen one is recorded with the output.
+
+- `nearest_network` (default, and the only rule before the `attachment` option existed): the nearest road of any component. Land whose nearest road lies on a component without points stays unassigned, because that road has no owner.
+- `nearest_reachable_network`: the nearest road on a component that contains at least one point. Land near a road without points then attaches to a farther road that has an owner.
+
+Example: a land point 10 m from a road without points and 100 m from a road of cluster A is unassigned under the first rule and belongs to A under the second. The second rule does not connect the two roads and does not claim that A's road can be reached from the nearer one; it only chooses a different road for attaching land. The exact network partition is the same under both rules. Equally near roads are decided by the smaller `edge_id` in string order under both rules, because the rank of `edge_id` is taken over the whole edge table.
+
+## 11. Adaptive grid spacing and what it measures
+
+A grid with spacing `r` can place a border between two clusters wrongly by up to about one cell, and can miss land narrower than a cell. `adaptive_surface_voronoi` renders grids with spacing `r0, r0·f, r0·f², …` (`f = refine_factor`) and compares each grid with the one before it.
+
+**Starting spacing.** A larger spacing never needs more grid squares, so the spacings whose grid fits `max_cells` form an interval `[r*, ∞)`. `_starting_resolution` finds `r*` by bisection on square counts only, without building a grid; it uses the geometric mean while the bracket spans more than a factor of 2, so that a request such as `1e-300` takes a few steps.
+
+**Comparison.** For each ownership category `k` (every cluster, and `unassigned`), let `A_k` and `B_k` be its land in the coarser and the finer grid. The share of land that changed owner is
+
+    changed = 1 − Σ_k area(A_k ∩ B_k) / area(boundary).
+
+Comparing the union of all polygons would show nothing, because both grids cover the whole boundary: two clusters that swap all their land give `changed = 1` here and an unchanged union. Per cluster, `IoU = area(A ∩ B) / area(A ∪ B)` is reported; a cluster with land in neither grid has no IoU (not 1), and a cluster with land in one grid only has IoU 0.
+
+**Stopping.** The loop stops with `converged` when two consecutive grids meet the `ConvergencePolicy` (by default: `changed ≤ 0.005`, and no cluster in the state `grid_lost`, section 12). It stops with `budget_limited` when the next grid would exceed `max_cells`, and with `refinement_limit` when `max_refinements` finer grids have been tried. One grid alone is never `converged`. The result is always the finest grid that passed the geometry checks below.
+
+**What `converged` means.** Two consecutive grids agreed within the policy. It does not mean that the polygons are exact: a different grid origin or a third, finer grid can still change them, especially for narrow territories. The thresholds are settings, not error bounds derived from the geometry.
+
+**How far from convergence real inputs are.** On a synthetic city (a 15 km × 15 km road grid with 100 m blocks, 1,500 clusters of 1–4 points), the share of land that changed owner was 24 % between 100 m and 50 m, 7 % between 50 m and 25 m, and 4.5 % between 25 m and 12.5 m. Grid roads make the change large: inside each block, land is divided along the diagonals between the four surrounding roads, and every such line is drawn as a staircase of cells. Reaching 0.5 % would need a spacing of a few metres, that is tens of millions of cells. With the default `max_cells`, such inputs end as `budget_limited`. The measured `changed` value is then the useful number: it estimates the share of land whose owner still depends on the grid.
+
+**Geometry checks.** Every grid must satisfy, with `B` the boundary and `P_k` the land of category `k`: each `P_k` is a valid polygon; `area(B − ∪P_k)`, `area(∪P_k − B)` and `Σ area(P_k) − area(∪P_k)` are each at most `1e-9 · area(B)`. The missing and overlapping areas are checked separately, because in one combined sum a gap and an overlap of equal size cancel. Under `nearest_reachable_network` there must be no unassigned land. A coarse grid never breaks these rules (it covers the boundary exactly once), so a failure stops the run instead of starting a finer grid.
+
+## 12. Why a cluster can lack land, and which cases a finer grid can fix
+
+A cluster can have no land in a rendering for different reasons, and only one of them is fixed by a finer grid. `territory_qa` separates them:
+
+- `no_network_length`: the cluster owns no positive network length, for example when its points share a node with points of a cluster with a smaller ID. This is a property of the exact partition.
+- `no_road_inside`: all of its road lies outside the boundary or on its outline. Typical when the road network extends beyond the study area. Land near the outline may still attach to such a road, so this means "not proven to exist", not "proven absent".
+- `shared_road_only`: its road inside the boundary is covered by roads of other owners (possible in custom networks with coincident edges). Also not proven either way.
+- `grid_lost`: it owns road inside the boundary that no road of another owner covers. Such a cluster has land of positive area, so a finer grid will recover it.
+
+The argument for `grid_lost`: take a point `p` on such a road, strictly inside the boundary, away from piece ends and from the tie band of `_assign_anchors`, and on no road of another owner. Roads are closed sets, so every road of another owner is at least some distance `d > 0` from `p`. A land point `g` with `|g − p| < d/2` has a road location within `d/2` (namely `p`), while every road of another owner is farther than `d/2` from `g`. So `g` attaches to a road of this cluster. The boundary interior contains a disk around `p`, so the cluster owns a disk of land with positive area. Crossing roads meet the piece in single points, which have no length; they do not affect the argument.
+
+Before this classification, the only evidence for "the grid lost this cluster" would be that the cluster owns network length somewhere. That evidence is wrong for a road network that extends beyond the boundary: a cluster outside the study area owns length but may have no land inside at any spacing, and treating it as a grid problem makes refinement continue until the budget is exhausted.
+
+## 13. Transactional output
+
+A GeoPackage is written one layer at a time. Deleting the old file first and then failing at a later layer would lose the previous valid output. `io._publish` therefore writes every layer to a new file with a unique temporary name in the target's folder, reads it back (`_check_staged`: SQLite integrity and foreign keys, the exact set of layers, and per layer the row count, column names and CRS), flushes it to disk, and only then moves it onto the target name with one `os.replace`. Within one folder this replaces the target in a single step. Any failure before that step leaves the old file byte for byte unchanged and removes the temporary file. The old file is never deleted to make room; on Windows, a target held open by another program makes `os.replace` fail, and that error is reported.
+
+The file is flushed through a handle opened for reading and writing, because Windows refuses to flush (`FlushFileBuffers`) a handle opened only for reading.
+
+How the file was made is recorded inside the same file, in the table `netvoronoi_manifest` (one row, one JSON text): software versions, input files with size and SHA-256, network size and CRS, tie rules, and for a surface the attachment policy, spacing, and for an adaptive run every attempt with its measurements and the final status. Keeping it in the same file means it cannot be separated from the layers it describes.
+
+
+## 14. v3 convergence-domain and territory evidence contracts
+
+The changed-owner-area statistic is meaningful only for two renderings of the **same geographic domain** in the **same CRS** with the **same attachment policy**. Equal total area is not enough: two distant polygons may have equal areas but no common land. Every regular rendering therefore carries its boundary geometry. The comparison checks that the symmetric difference of the domains is below a small relative numeric tolerance. Older result objects without stored boundaries are checked using the union of their rendered grid cells; this slower path preserves compatibility.
+
+Territory diagnostics separate evidence from inference. `present` means positive-area land was observed in the current rendering. `grid_lost` means a positive-area territory can be demonstrated from an unshared road piece, even though the current grid missed it. `no_road_inside` and `shared_road_only` do **not** mean absence of true land; they mean its existence could not be established with this test. The `territory_evidence` field states this separately. A reported `converged` result means only two successive grids passed the selected changed-owner and optional IoU thresholds. It is **not** a certified error bound or proof that all true planar territories were represented.
+
+## 15. Input consistency and fail-fast publication
+
+For command-line runs, input content is hashed before reading, immediately after reading, and again after the staged GeoPackage is validated but before replacing the destination. Folder datasets are hashed as ordered collections of relative file names and file contents. Symlinks are rejected. If an input differs between checkpoints, the command aborts and retains the old destination. This is a *multi-checkpoint integrity guard*, not an immutable filesystem snapshot; adversarial changes between a check and the subsequent operation are outside its guarantee.
+
+The transaction refuses an output path that aliases an input, or one with live SQLite `-wal`, `-shm`, or `-journal` sidecar files. It never attempts to delete the destination sidecars of a possibly active connection. The staged database is read back and its file handle is fsynced before `os.replace`.
+
+On POSIX, a directory fsync follows replacement. If this fails, the new file has already been published. A distinct `PublicationDurabilityError` reports `published=True`, instead of pretending that the old file is intact or suppressing a durability problem. Windows does not provide this POSIX directory fsync; the staged file's fsync still occurs. Platform-level crash durability cannot be promised merely from successful `os.replace` on every filesystem.
