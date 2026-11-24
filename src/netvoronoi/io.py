@@ -78,6 +78,34 @@ class PublicationDurabilityError(RuntimeError):
         )
 
 
+class PublicationCleanupError(RuntimeError):
+    """The destination was replaced, but removal of a staging sidecar failed.
+
+    The new output is already in place; its final state must be inspected
+    before any retry. This remains separate from directory-sync failure.
+    """
+
+    def __init__(self, target: Path):
+        self.target = target
+        self.published = True
+        super().__init__(
+            f"output was replaced at {target}, but staging cleanup failed; "
+            "inspect the destination and the staging files before retrying"
+        )
+
+
+class OutputInUseError(RuntimeError):
+    """The target GeoPackage has SQLite side files, so another program may be using it.
+
+    A GeoPackage is a SQLite database. While a program such as QGIS has it
+    open for editing, SQLite keeps ``-wal`` and ``-shm`` files beside it; an
+    interrupted write can leave a ``-journal`` file. Those files belong to
+    the old database, so the old file is not replaced while they exist.
+    Nothing is written. This is a subclass of ``RuntimeError``, as before it
+    had its own name, so code that caught ``RuntimeError`` still works.
+    """
+
+
 def _check_target_safe(target: Path) -> None:
     """Refuse a symlink or SQLite sidecar at the destination.
 
@@ -92,10 +120,22 @@ def _check_target_safe(target: Path) -> None:
     sidecars = [Path(str(target) + suffix) for suffix in ("-wal", "-shm", "-journal")]
     occupied = [path for path in sidecars if path.exists() or path.is_symlink()]
     if occupied:
-        raise RuntimeError(
+        raise OutputInUseError(
             "refusing to replace GeoPackage with existing SQLite sidecar(s): "
             + ", ".join(str(path) for path in occupied)
         )
+
+
+def check_output_target(path: str | Path) -> Path:
+    """Run the destination checks of ``_publish`` early: no symbolic link, no SQLite side files.
+
+    ``_publish`` runs the same checks again just before it replaces the
+    file. Calling this first lets the command line fail in a second, before
+    it reads inputs and computes for minutes, instead of at the end.
+    """
+    path = Path(path)
+    _check_target_safe(path)
+    return path
 
 
 def _write(table: pd.DataFrame, path: Path, layer: str) -> None:
@@ -238,6 +278,8 @@ def _publish(
     # removed so that the writer does not try to open it as a database. The
     # name stays unique to this call.
     staged.unlink()
+    replaced = False
+    primary_error: BaseException | None = None
     try:
         for layer, table in layers:
             _write(table, staged, layer)
@@ -256,15 +298,33 @@ def _publish(
         if target.exists() and not overwrite:
             raise FileExistsError(f"output appeared while it was being written: {target}")
         os.replace(staged, target)
+        replaced = True  # Any subsequent failure MUST be reported as post-publication.
         try:
             _flush_folder(target.parent)
-        except OSError as exc:
+        except Exception as exc:
             raise PublicationDurabilityError(target) from exc
         return target
+    except BaseException as exc:
+        # Preserve the primary error if cleanup also fails before publication.
+        # This includes KeyboardInterrupt and SystemExit, which are re-raised.
+        primary_error = exc
+        raise
     finally:
+        cleanup_error: Exception | None = None
         for leftover in (staged, *(Path(str(staged) + s) for s in ("-journal", "-wal", "-shm"))):
-            if leftover.exists():
-                leftover.unlink()
+            try:
+                if leftover.exists() or leftover.is_symlink():
+                    leftover.unlink()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            if replaced:
+                # Even if a directory-fsync error was already being raised,
+                # never let this become a generic exit-1 failure.
+                raise PublicationCleanupError(target) from cleanup_error
+            if primary_error is None:
+                raise cleanup_error
 
 
 def _flush_folder(folder: Path) -> None:

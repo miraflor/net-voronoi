@@ -386,17 +386,23 @@ A <code>converged</code> status does not certify completeness of all true planar
 
 <p>Every CLI GeoPackage includes a <code>netvoronoi_manifest</code> attribute table; CLI
 surface outputs also include <code>surface_territory_qa</code>. The manifest records
-software versions, input SHA-256 fingerprints, model settings, and (for adaptive runs)
-the refinement attempts, convergence measurements and status.</p>
+software versions, a SHA-256 of the package source (the version stays 0.2.0 on
+<code>main</code>, so it cannot identify the code), input SHA-256 fingerprints, model settings,
+and (for adaptive runs) the refinement attempts, convergence measurements and status.</p>
 
 <p>Outputs are staged and checked for SQLite integrity, layers, row counts, fields and CRS
 before replacing an existing file. Input files are hashed before and after reading and
 immediately before publication; these are consistency checkpoints, not immutable snapshots.
+A shapefile is hashed with its <code>.shx</code>, <code>.dbf</code>, <code>.prj</code> and
+<code>.cpg</code> and <code>.shp.xml</code> files, because labels are in <code>.dbf</code> and newer GDAL versions may read extended field names from <code>.shp.xml</code>; a GeoPackage
+is hashed with its <code>-wal</code> file when one exists.
 Publication rejects active destination SQLite sidecars and unsafe source/output aliasing.
 Before replacement, failures leave the old destination intact. After replacement,
 a directory-sync failure raises <code>PublicationDurabilityError(published=True)</code>
-because the new file has already been installed. On Windows the staged file is fsynced,
-but POSIX directory fsync is not available.</p>
+and a staging cleanup failure raises <code>PublicationCleanupError(published=True)</code>;
+both occur after installation and exit with code 3. Pre-replacement errors exit with code 1
+and do not replace the destination. Do not manually delete SQLite WAL or journal files. On Windows the staged file
+is fsynced, but POSIX directory fsync is not available.</p>
 
 <h2 id="8-fast-node-winners">8. How the package gets node winners with few searches</h2>
 

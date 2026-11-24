@@ -2,13 +2,25 @@
 
 ## Unreleased
 
+**Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata remains at version `0.2.0` until a new release is cut. One exit code changed: a failure after the output was replaced now exits with 3 instead of 1 (see below).
+
+### Input hashing of multi-file datasets, code identification and exit codes
+
+- A shapefile input is hashed together with its `.shx`, `.dbf`, `.prj`, `.cpg` and `.shp.xml` files (any letter case), and a GeoPackage or other SQLite input together with its `-wal` file when one exists. Before, only the named file was hashed, so a change to the cluster labels, which a shapefile keeps in its `.dbf`, changed neither the recorded hash nor the "input changed" check. Such inputs are recorded as `kind: "file_set"` with a `members` list; single-file records are unchanged.
+- The manifest records `netvoronoi_code_sha256`, a SHA-256 of the package's Python source with line endings normalized, because the version string stays `0.2.0` on `main` and cannot identify the code.
+- The CLI checks the output for SQLite side files and symbolic links before reading any input, and reports an output in use as one `Error:` line (exit code 1) instead of a traceback after the computation. The error is `OutputInUseError`, a subclass of `RuntimeError`.
+- Post-replacement directory-sync (`PublicationDurabilityError`) **or staging cleanup** (`PublicationCleanupError`) errors both exit with code 3, so that exit code 1 cannot conceal an already-replaced output. Staging cleanup failures are not silently ignored.
+- Destination SQLite `-wal` and `-journal` files must not be manually deleted; use SQLite-aware checkpointing/recovery and close open applications before retrying.
+- Added Windows/Linux CI and injected post-replacement cleanup failure tests.
+- DESIGN.md sections 14 and 15 have descriptive titles; section 15 no longer repeats section 13. Removed an unused import in a test.
+
 ### Documentation alignment
 
 - Synchronize the README, mathematical design notes and visual guide with the merged adaptive rendering, territory evidence, provenance and transactional publication APIs.
 - Correct the visual guide's exact network result field to `unassigned_edges` and clarify the difference between pre-replacement and post-replacement failures.
 - Keep the package version at `0.2.0` until a separate versioned release.
 
-### Adaptive surface rendering and v3 hardening (merged into `main` via PR #1)
+### Hardening of comparisons, territory evidence, input checks and publication (merged into `main` via PR #1)
 
 - Convergence comparisons reject different geographic domains, different CRSs and different attachment policies. Internal comparisons reuse the stored clipping boundary without reconstructing an expensive grid union.
 - Territory QA reports `territory_evidence`: `no_road_inside` and `shared_road_only` are *undetermined*, not proofs of absent land. Adaptive manifests distinguish grid-to-grid stability from exact territory completeness.
@@ -16,8 +28,7 @@
 - Transactional publication rejects destination WAL/journal sidecars and symlink targets, and reports a post-replacement directory-sync failure as `PublicationDurabilityError(published=True)` rather than silently ignoring it.
 - Existing fixed-rendering geometry, network ownership and tie rules are unchanged.
 
-
-**Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata remains at version `0.2.0` until a new release is cut.
+### Adaptive surface, attachment policies and transactional output (merged into `main` via PR #1)
 
 - **Transactional GeoPackage output.** All layers are written to a temporary file in the target's folder, read back and checked (SQLite integrity and foreign keys, layer names, row counts, column names, CRS), flushed, and then moved onto the target with one `os.replace`. Before, `--force` deleted the old file first, so a failure in a later layer lost the previous output. The flush uses a read-write handle because Windows cannot flush a read-only one.
 - **`netvoronoi_manifest`** in every CLI output: a table without geometry holding one JSON text with software versions, input files (size and SHA-256), network size and CRS, tie rules and surface settings.
