@@ -2,6 +2,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import pytest
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from netvoronoi import from_geodataframes, network_voronoi
@@ -27,11 +28,16 @@ def test_output_overwrite_guard(tmp_path):
 
 
 def test_cli_has_no_epsilon_option():
+    # Inspect registered option names, not Rich-formatted help output:
+    # the latter depends on Typer version and terminal width.
+    build_command = get_command(app).commands["build"]
+    options = {name for parameter in build_command.params for name in getattr(parameter, "opts", ())}
+    assert "--epsilon" not in options
+    assert "--cluster-col" in options
+
     runner = CliRunner()
     result = runner.invoke(app, ["build", "--help"])
     assert result.exit_code == 0
-    assert "--epsilon" not in result.stdout
-    assert "--cluster-col" in result.stdout
 
 
 def test_cli_reader_dispatches_parquet_to_read_parquet(monkeypatch, crs):
