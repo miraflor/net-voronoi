@@ -6,7 +6,7 @@ Input points already have cluster labels. The package does not create clusters a
 
 There is **no additive tolerance / epsilon Voronoi mode**. Cells are exclusive in positive network length.
 
-The [visual algorithm guide](docs/index.html) illustrates the exact lineal construction. This README documents the current `main` branch, including adaptive features not yet included in a new tagged release.
+The [visual algorithm guide](docs/index.html) illustrates the exact lineal construction. This README documents the v0.3.0 codebase, including adaptive surface rendering and transactional publication.
 
 ## Method
 
@@ -154,7 +154,7 @@ The CLI takes SHA-256 snapshots of each input **before reading it, immediately a
 
 Each staged GeoPackage undergoes SQLite integrity and foreign-key checks, plus verification of layer names, row counts, field names and CRS before publication. Attribute tables such as `netvoronoi_manifest` and `surface_territory_qa` are included in the transaction and are visible to GeoPackage-aware applications. The CLI writes these tables automatically; direct Python calls to the writers require callers to supply the optional `manifest` and `territories` arguments.
 
-The package version stays `0.2.0` on `main` until the next release, so the manifest also records `netvoronoi_code_sha256`, a SHA-256 of the package's Python source that is the same on Windows and Linux. Changes to the package's `.py` source files change this fingerprint even when the version string is unchanged. The fingerprint is not a complete build identifier: it excludes packaging configuration and third-party dependency code.
+The manifest also records `netvoronoi_code_sha256` beyond the package version, a SHA-256 of the package's Python source that is the same on Windows and Linux. Changes to the package's `.py` source files change this fingerprint even when the version string is unchanged. The fingerprint is not a complete build identifier: it excludes packaging configuration and third-party dependency code.
 
 If a run fails **after** `os.replace`, the new output may already be present. The typed `PublicationDurabilityError` and `PublicationCleanupError` explicitly mark `published=True`; inspect the destination instead of assuming the old file survived. On Windows, the package fsyncs the staged file but does not perform POSIX directory fsync. See [DESIGN.md, sections 13–15](DESIGN.md#13-transactional-output) for the full failure contract.
 
@@ -301,9 +301,9 @@ Measured on one machine with a regular grid of roads with 50 m spacing and rando
 
 The slowest case for `network_voronoi` is when exact ties are everywhere (for example, all points on grid nodes): every cluster then needs its own shortest-path search. With about 1,000,000 edges and 5,000 clusters this took about 23 s.
 
-## Scope of current `main` (unreleased additions since v0.2.0)
+## Scope of v0.3.0
 
-Adaptive rendering, the attachment selector, provenance and transactional output are merged into `main`, but the package metadata and latest tagged release still report `0.2.0`. These additions have not yet received their own versioned release.
+Version 0.3.0 includes adaptive rendering, the attachment selector, provenance safeguards and transactional GeoPackage publication, while retaining the exact network Voronoi engine.
 
 Supported: projected undirected simple line networks, geometric edge length as impedance, LineString/MultiLineString road data, clustered point input, exact insertion of snapped points, multi-source shortest paths by cluster, disconnected components, deterministic ties, transactional GeoPackage output with an embedded manifest, optional Parquet input (with `netvoronoi[parquet]`), and optional grid-rendered polygon cells with two attachment policies and adaptive grid spacing.
 

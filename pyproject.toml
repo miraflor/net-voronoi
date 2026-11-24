@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netvoronoi"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cluster-based Voronoi regions informed by shortest-path distance on spatial networks"
 readme = "README.md"
 requires-python = ">=3.10"
