@@ -595,7 +595,7 @@ def _manifest(inputs: dict, network, *, surface: dict | None, accepted: str) -> 
         "surface": surface,
         "publication": {
             "accepted_status": accepted,
-            "input_consistency": "SHA-256 of every file of each input dataset, checked before reading, "
+            "input_consistency": "SHA-256 of recognized dataset components, checked before reading, "
             "after reading and before atomic replacement",
             "durability": "staged file fsync; directory fsync on POSIX; not guaranteed on Windows",
         },

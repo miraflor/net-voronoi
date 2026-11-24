@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Documentation and contract clarification
+
+- Clarify that input provenance covers recognized multi-file components, not every GIS format.
+- Align CLI-option, exit-code and cleanup documentation with the implementation, including in-source annotations. No numerical algorithms change.
+
 **Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata remains at version `0.2.0` until a new release is cut. One exit code changed: a failure after the output was replaced now exits with 3 instead of 1 (see below).
 
 ### Input hashing of multi-file datasets, code identification and exit codes

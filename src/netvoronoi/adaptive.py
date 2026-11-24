@@ -383,7 +383,7 @@ def territory_qa(network: SpatialNetwork, boundary, surface: SurfaceVoronoiResul
       - ``grid_lost``: no land here, but the cluster owns road inside the
         boundary that no road of another owner covers. Such a cluster has
         land of positive area (proof in ``_unshared_length_inside``), so a
-        finer grid recovers it;
+        sufficiently fine grid can represent it, provided the grid budget permits;
       - ``no_road_inside``: no land here, and all of the cluster's road lies
         outside the boundary or on its outline. Typical when the road network
         extends beyond the study area. Land near the outline may still attach
