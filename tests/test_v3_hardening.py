@@ -6,7 +6,6 @@ is different: replacement already happened, and the typed error must say so.
 """
 
 from dataclasses import replace
-import os
 
 import geopandas as gpd
 import pandas as pd

@@ -150,11 +150,22 @@ Expect `budget_limited` on city-sized inputs. On a synthetic 15 km × 15 km road
 
 ## Publication and reproducibility
 
-The CLI takes SHA-256 snapshots of each input **before reading it, immediately after reading it, and immediately before replacing the output**. Directory datasets are hashed by their member paths and contents. Changed inputs, source/output path aliasing, symlinks in input datasets, and destination SQLite `-wal`, `-shm` or `-journal` files stop publication. These checkpoints detect changes; they are not immutable snapshots and cannot eliminate every concurrent modification race.
+The CLI takes SHA-256 snapshots of each input **before reading it, immediately after reading it, and immediately before replacing the output**. Directory datasets are hashed by their member paths and contents. A dataset stored in several files is hashed as a whole: a shapefile with its `.shx`, `.dbf`, `.prj`, `.cpg` and `.shp.xml` files (labels are in `.dbf`; newer GDAL versions may use `.shp.xml` for extended field metadata), and a GeoPackage with its `-wal` file when one exists. The manifest then lists each member file with its own size and SHA-256. Changed inputs, source/output path aliasing, symlinks in input datasets, and destination SQLite `-wal`, `-shm` or `-journal` files stop publication. These checkpoints detect changes; they are not immutable snapshots and cannot eliminate every concurrent modification race.
 
 Each staged GeoPackage undergoes SQLite integrity and foreign-key checks, plus verification of layer names, row counts, field names and CRS before publication. Attribute tables such as `netvoronoi_manifest` and `surface_territory_qa` are included in the transaction and are visible to GeoPackage-aware applications. The CLI writes these tables automatically; direct Python calls to the writers require callers to supply the optional `manifest` and `territories` arguments.
 
-If a run fails **after** `os.replace`, the new output may already be present. The typed `PublicationDurabilityError` explicitly marks `published=True`; inspect the destination instead of assuming the old file survived. On Windows, the package fsyncs the staged file but does not perform POSIX directory fsync. See [DESIGN.md, sections 13–15](DESIGN.md#13-transactional-output) for the full failure contract.
+The package version stays `0.2.0` on `main` until the next release, so the manifest also records `netvoronoi_code_sha256`, a SHA-256 of the package's Python source that is the same on Windows and Linux. Two files made by different code have different values even when the version is the same.
+
+If a run fails **after** `os.replace`, the new output may already be present. The typed `PublicationDurabilityError` and `PublicationCleanupError` explicitly mark `published=True`; inspect the destination instead of assuming the old file survived. On Windows, the package fsyncs the staged file but does not perform POSIX directory fsync. See [DESIGN.md, sections 13–15](DESIGN.md#13-transactional-output) for the full failure contract.
+
+Exit codes of `netvoronoi build`, so that a script can tell whether the output changed. Never manually delete SQLite `-wal` or `-journal` files while recovering an occupied destination: close all database users and use SQLite-aware checkpointing or recovery instead.
+
+| Code | Meaning | Output file |
+|---|---|---|
+| 0 | Written and checked. | New file in place. |
+| 1 | Failure before replacing the destination, including invalid inputs, convergence not demonstrated, source changes, or occupied destination sidecars. | Existing destination unchanged; transient staging files may have been attempted. |
+| 2 | Command-line usage error found by Typer before the command ran, for example an unknown option. | Unchanged. |
+| 3 | The output was replaced, but directory sync (`PublicationDurabilityError`) or staging cleanup (`PublicationCleanupError`) failed. | New destination in place; inspect before retrying. Crash durability may be unconfirmed if sync failed. |
 
 ## Install
 
@@ -215,7 +226,7 @@ netvoronoi build `
 
 Options that only apply to `--adaptive` (`--refine-factor`, `--max-refinements`, `--changed-area-max`, `--min-cluster-iou`, `--allow-missing-territories`, `--accept-nonconverged`) are refused without it, and `--adaptive` and `--attachment` are refused without `--boundary`, before any input file is read.
 
-Files ending in `.parquet` or `.geoparquet` are read with `geopandas.read_parquet`; all other files with `geopandas.read_file`. Re-running against an existing output requires `--force`. Input problems (a missing column, a point too far from the roads, an existing output file) are reported as one `Error: ...` line with exit code 1.
+Files ending in `.parquet` or `.geoparquet` are read with `geopandas.read_parquet`; all other files with `geopandas.read_file`. Re-running against an existing output requires `--force`. Input problems (a missing column, a point too far from the roads, an existing output file, an output that another program has open) are reported as one `Error: ...` line with exit code 1; the output is then unchanged. See [Publication and reproducibility](#publication-and-reproducibility) for all exit codes.
 
 ## Python API
 

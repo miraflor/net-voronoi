@@ -12,6 +12,21 @@ Reading order:
    one GeoPackage as a transaction (see ``io.py``);
 4. ``_manifest`` records how the file was made; it is written into the same
    GeoPackage as the table ``netvoronoi_manifest``.
+
+Exit codes. A script needs to know whether the target file changed, so the
+codes separate "nothing was written" from "the file was written":
+
+* 0: the output was written and checked;
+* 1: nothing was written, and an existing output is unchanged (an input or
+  option error, convergence not demonstrated, the output in use by another
+  program, an input that changed during the run, or any failure before the
+  replacement step);
+* 2: a command-line usage error found by Typer before the command ran
+  (for example an unknown option); nothing was written;
+* 3: the output WAS replaced, but directory sync or post-publication
+  cleanup failed (``PublicationDurabilityError`` or
+  ``PublicationCleanupError``). Inspect the new destination before retrying;
+  crash durability may be unconfirmed when folder sync failed.
 """
 
 from __future__ import annotations
@@ -31,13 +46,24 @@ import typer
 from . import __version__
 from .adaptive import ConvergenceError, ConvergencePolicy, adaptive_surface_voronoi, territory_qa
 from .core import network_voronoi
-from .io import PublicationDurabilityError, check_output_path, write_network_gpkg, write_surface_gpkg
+from .io import (
+    OutputInUseError,
+    PublicationCleanupError,
+    PublicationDurabilityError,
+    check_output_path,
+    check_output_target,
+    write_network_gpkg,
+    write_surface_gpkg,
+)
 from .network import from_geodataframes
 from .surface import ATTACHMENT_POLICIES, DEFAULT_MAX_CELLS, check_grid_size, surface_voronoi
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 _PARQUET_SUFFIXES = {".parquet", ".geoparquet"}
+
+EXIT_NOTHING_WRITTEN = 1
+EXIT_WRITTEN_DURABILITY_UNCONFIRMED = 3  # Post-replacement error; 2 is used for Typer usage errors
 
 # Defaults of the adaptive options. The options themselves default to None,
 # which means "not given", so that ``_check_options`` can refuse them when
@@ -161,10 +187,20 @@ def build(
     except (ValueError, FileExistsError) as exc:
         # Input problems are reported as one line, not as a traceback.
         typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    except PublicationDurabilityError as exc:
+        raise typer.Exit(code=EXIT_NOTHING_WRITTEN) from exc
+    except OutputInUseError as exc:
+        typer.echo(
+            f"Error: {exc}. Nothing was written. Close the GeoPackage in QGIS or any other program; "
+            "do not delete SQLite -wal/-journal files manually. Close the applications and use "
+            "SQLite-aware recovery or checkpointing before retrying.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_NOTHING_WRITTEN) from exc
+    except (PublicationDurabilityError, PublicationCleanupError) as exc:
+        # Both failures happen after the destination has been replaced. A
+        # cleanup error must not be mistaken for a pre-publication failure.
         typer.echo(f"Error: {exc}. Inspect the published destination before retrying.", err=True)
-        raise typer.Exit(code=1) from exc
+        raise typer.Exit(code=EXIT_WRITTEN_DURABILITY_UNCONFIRMED) from exc
     except ConvergenceError as exc:
         typer.echo(
             f"Error: convergence was not demonstrated ({exc}). Nothing was written. Options: raise --max-cells "
@@ -172,7 +208,7 @@ def build(
             "result with its status recorded.",
             err=True,
         )
-        raise typer.Exit(code=1) from exc
+        raise typer.Exit(code=EXIT_NOTHING_WRITTEN) from exc
 
 
 def _check_options(
@@ -193,6 +229,9 @@ def _check_options(
 ) -> ConvergencePolicy | None:
     """Check the options that need no file; return the convergence policy (``None`` without ``--adaptive``)."""
     check_output_path(output, overwrite=force)
+    # The output must not be a symbolic link or have SQLite side files.
+    # ``io._publish`` checks this again just before replacing the file.
+    check_output_target(output)
     if attachment not in ATTACHMENT_POLICIES:
         raise ValueError(f"--attachment must be one of {', '.join(ATTACHMENT_POLICIES)}")
     if boundary_path is None and (adaptive or attachment != "nearest_network"):
@@ -369,13 +408,79 @@ def _digest_file(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _file_record(path: Path, layer: str | None) -> dict:
-    """Snapshot a vector input by content, including a directory dataset.
+def _combined_digest(entries: list[tuple[str, int, str]]) -> str:
+    """One SHA-256 for several files, from ``(name, size, sha256)`` triples in the given order.
 
-    A directory's entries are hashed in sorted relative-path order; each
-    entry contributes its path, size and content digest. Symlinks are
-    rejected rather than traversed, since they could escape the snapshot
-    or change targets. A changed folder member blocks publication.
+    Each name is preceded by its length, so that two different lists of
+    names can never produce the same sequence of bytes.
+    """
+    digest = hashlib.sha256()
+    for name, size, file_hash in entries:
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(file_hash))
+    return digest.hexdigest()
+
+
+# Files that GDAL reads together when the user names only one of them.
+# A shapefile keeps geometry in .shp, the record index in .shx, the
+# attributes (including the cluster column) in .dbf, the CRS in .prj and
+# the text encoding in .cpg. GDAL 3.13+ can read extended DBF field names
+# from .shp.xml, so those sidecars affect interpreted inputs too. Spatial
+# indexes (.qix, .sbn, .sbx) do not change feature values and are omitted.
+_SHAPEFILE_PARTS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".shp.xml")
+# A SQLite database in WAL mode (QGIS uses it for GeoPackages it edits)
+# keeps recently committed changes in a "-wal" file beside the main file
+# until they are copied back; a reader sees those changes, so they are data.
+_SQLITE_SUFFIXES = (".gpkg", ".sqlite", ".db")
+
+
+def _dataset_files(path: Path) -> list[Path]:
+    """The files that make up the dataset named by ``path``, in a fixed order.
+
+    * ``points.shp``: every file in the same folder named ``points`` plus
+      one of ``_SHAPEFILE_PARTS`` (including ``points.shp.xml``), in any
+      letter case (``POINTS.DBF``
+      counts, because GDAL also finds it);
+    * ``roads.gpkg`` (or ``.sqlite``, ``.db``): the file, and
+      ``roads.gpkg-wal`` when it exists;
+    * any other file: the file alone.
+
+    Other files with the same base name, such as ``points.csv`` or an output
+    ``points.gpkg`` written beside the input, are not part of the dataset and
+    are not included: an output must never count as an input.
+
+    Example: a folder holding ``points.shp``, ``points.shx``, ``points.dbf``,
+    ``points.prj`` and ``points.csv`` gives the first four for ``points.shp``.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".shp":
+        wanted = {path.stem.lower() + part for part in _SHAPEFILE_PARTS}
+        files = [p for p in path.parent.iterdir() if p.name.lower() in wanted]
+        return sorted(files, key=lambda p: (p.name.lower(), p.name))
+    if suffix in _SQLITE_SUFFIXES:
+        wal = path.with_name(path.name + "-wal")
+        return [path, wal] if wal.exists() or wal.is_symlink() else [path]
+    return [path]
+
+
+def _file_record(path: Path, layer: str | None) -> dict:
+    """Snapshot a vector input by content: a single file, a set of files, or a folder.
+
+    * A single file gives ``kind="file"`` and the SHA-256 of its bytes.
+    * A dataset of several files (a shapefile; a GeoPackage with a ``-wal``
+      file; see ``_dataset_files``) gives ``kind="file_set"``, one SHA-256
+      over all members, and a ``members`` list with each file's name, size
+      and SHA-256. Before this, only the named file was hashed, so a change
+      to the cluster labels in a shapefile's ``.dbf`` went unnoticed.
+    * A folder dataset (for example a File Geodatabase) gives
+      ``kind="folder"``: every file in it, in sorted relative-path order.
+
+    Symlinks are rejected rather than followed, since they could point
+    outside the snapshot or change targets. A changed member blocks
+    publication (``_verify_input_records``).
     """
     path = Path(path)
     record = {"path": str(path), "layer": layer}
@@ -389,23 +494,57 @@ def _file_record(path: Path, layer: str | None) -> dict:
             if child.is_file():
                 files.append(child)
         files.sort(key=lambda child: child.relative_to(path).as_posix())
-        digest = hashlib.sha256()
-        total_size = 0
-        for child in files:
-            relative = child.relative_to(path).as_posix().encode("utf-8")
-            size, file_hash = _digest_file(child)
-            digest.update(len(relative).to_bytes(8, "big"))
-            digest.update(relative)
-            digest.update(size.to_bytes(8, "big"))
-            digest.update(bytes.fromhex(file_hash))
-            total_size += size
-        record.update(kind="folder", files=len(files), bytes=total_size, sha256=digest.hexdigest())
+        entries = [(child.relative_to(path).as_posix(), *_digest_file(child)) for child in files]
+        record.update(
+            kind="folder",
+            files=len(entries),
+            bytes=sum(size for _, size, _ in entries),
+            sha256=_combined_digest(entries),
+        )
         return record
     if not path.is_file():
         raise ValueError(f"input source is not a readable regular file: {path}")
-    size, file_hash = _digest_file(path)
-    record.update(kind="file", bytes=size, sha256=file_hash)
+    members = _dataset_files(path)
+    for member in members:
+        if member.is_symlink():
+            raise ValueError(f"input dataset contains a symbolic link: {member}")
+        if not member.is_file():
+            raise ValueError(f"input dataset member is not a regular file: {member}")
+    if len(members) == 1:
+        size, file_hash = _digest_file(path)
+        record.update(kind="file", bytes=size, sha256=file_hash)
+        return record
+    entries = [(member.name, *_digest_file(member)) for member in members]
+    record.update(
+        kind="file_set",
+        files=len(entries),
+        bytes=sum(size for _, size, _ in entries),
+        sha256=_combined_digest(entries),
+        members=[{"name": name, "bytes": size, "sha256": file_hash} for name, size, file_hash in entries],
+    )
     return record
+
+
+def _code_fingerprint(package: Path | None = None) -> str | None:
+    """SHA-256 of the package's Python source, identical on Windows and Linux.
+
+    Why: between releases, ``main`` keeps the version string of the last
+    release, so the version alone cannot tell the released code from later
+    code. This hash can. Every ``.py`` file of the package contributes its
+    name and its content, taken in name order. Windows line endings (CRLF)
+    are turned into LF first, so a Windows checkout and a Linux checkout of
+    the same commit give the same hash. Returns ``None`` when no source file
+    is found (for example an installation with compiled files only).
+    """
+    folder = Path(__file__).resolve().parent if package is None else Path(package)
+    sources = sorted(folder.glob("*.py"), key=lambda p: p.name)
+    if not sources:
+        return None
+    entries = []
+    for source in sources:
+        text = source.read_bytes().replace(b"\r\n", b"\n")
+        entries.append((source.name, len(text), hashlib.sha256(text).hexdigest()))
+    return _combined_digest(entries)
 
 
 def _verify_input_records(inputs: dict) -> None:
@@ -430,6 +569,9 @@ def _manifest(inputs: dict, network, *, surface: dict | None, accepted: str) -> 
         "manifest_schema": "netvoronoi.manifest.v1",
         "software": {
             "netvoronoi": __version__,
+            # The version stays at the last release on main; this hash tells
+            # the exact code apart (see _code_fingerprint).
+            "netvoronoi_code_sha256": _code_fingerprint(),
             "python": platform.python_version(),
             "geopandas": gpd.__version__,
             "numpy": numpy.__version__,
@@ -453,7 +595,8 @@ def _manifest(inputs: dict, network, *, surface: dict | None, accepted: str) -> 
         "surface": surface,
         "publication": {
             "accepted_status": accepted,
-            "input_consistency": "SHA-256 checked before reading, after reading and before atomic replacement",
+            "input_consistency": "SHA-256 of every file of each input dataset, checked before reading, "
+            "after reading and before atomic replacement",
             "durability": "staged file fsync; directory fsync on POSIX; not guaranteed on Windows",
         },
     }
