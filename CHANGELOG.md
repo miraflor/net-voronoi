@@ -1,18 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-24
 
 ### Documentation and contract clarification
 
 - Clarify that input provenance covers recognized multi-file components, not every GIS format.
 - Align CLI-option, exit-code and cleanup documentation with the implementation, including in-source annotations. No numerical algorithms change.
 
-**Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata remains at version `0.2.0` until a new release is cut. One exit code changed: a failure after the output was replaced now exits with 3 instead of 1 (see below).
+**Compatibility:** the exact network engine and default fixed-resolution geometry are unchanged. Existing GeoPackage map layers retain their meaning; CLI outputs gain two attribute tables (`netvoronoi_manifest`, and `surface_territory_qa` for surfaces). Package metadata is updated to version `0.3.0` for this release. One exit code changed: a failure after the output was replaced now exits with 3 instead of 1 (see below).
 
 ### Input hashing of multi-file datasets, code identification and exit codes
 
 - A shapefile input is hashed together with its `.shx`, `.dbf`, `.prj`, `.cpg` and `.shp.xml` files (any letter case), and a GeoPackage or other SQLite input together with its `-wal` file when one exists. Before, only the named file was hashed, so a change to the cluster labels, which a shapefile keeps in its `.dbf`, changed neither the recorded hash nor the "input changed" check. Such inputs are recorded as `kind: "file_set"` with a `members` list; single-file records are unchanged.
-- The manifest records `netvoronoi_code_sha256`, a SHA-256 of the package's Python source with line endings normalized, because the version string stays `0.2.0` on `main` and cannot identify the code.
+- The manifest records `netvoronoi_code_sha256`, a SHA-256 of the package's Python source with line endings normalized, to distinguish the exact Python source beyond the version identifier.
 - The CLI checks the output for SQLite side files and symbolic links before reading any input, and reports an output in use as one `Error:` line (exit code 1) instead of a traceback after the computation. The error is `OutputInUseError`, a subclass of `RuntimeError`.
 - Post-replacement directory-sync (`PublicationDurabilityError`) **or staging cleanup** (`PublicationCleanupError`) errors both exit with code 3, so that exit code 1 cannot conceal an already-replaced output. Staging cleanup failures are not silently ignored.
 - Destination SQLite `-wal` and `-journal` files must not be manually deleted; use SQLite-aware checkpointing/recovery and close open applications before retrying.
@@ -23,7 +23,7 @@
 
 - Synchronize the README, mathematical design notes and visual guide with the merged adaptive rendering, territory evidence, provenance and transactional publication APIs.
 - Correct the visual guide's exact network result field to `unassigned_edges` and clarify the difference between pre-replacement and post-replacement failures.
-- Keep the package version at `0.2.0` until a separate versioned release.
+- Align the package version and release metadata with `0.3.0`.
 
 ### Hardening of comparisons, territory evidence, input checks and publication (merged into `main` via PR #1)
 

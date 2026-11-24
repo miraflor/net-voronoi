@@ -64,7 +64,7 @@
     </nav>
 
     <div class="sidebar-footer">
-      <span>main (unreleased)</span>
+      <span>v0.3.0</span>
       <a href="https://github.com/miraflor/net-voronoi">View source</a>
     </div>
   </aside>
@@ -75,9 +75,8 @@
     <article class="doc-content" id="doc-content">
 
 <h1 id="how-net-voronoi-works">How <code>net-voronoi</code> works</h1>
-<p>This guide documents the current <code>main</code> branch. Adaptive rendering and transactional publication
-have been merged but have not received a separate tagged release; the package currently reports
-version <code>0.2.0</code>.</p>
+<p>This guide documents <code>netvoronoi</code> v0.3.0, including adaptive rendering,
+convergence diagnostics, input provenance and transactional publication.</p>
 
 <p class="lede"><code>net-voronoi</code> partitions a spatial network among <strong>pre-existing point clusters</strong>.
 A network location belongs to the cluster whose nearest member point is closest by shortest-path
@@ -386,8 +385,8 @@ A <code>converged</code> status does not certify completeness of all true planar
 
 <p>Every CLI GeoPackage includes a <code>netvoronoi_manifest</code> attribute table; CLI
 surface outputs also include <code>surface_territory_qa</code>. The manifest records
-software versions, a SHA-256 of the package source (the version stays 0.2.0 on
-<code>main</code>, so it cannot identify the code), input SHA-256 fingerprints, model settings,
+software versions, a SHA-256 of the package Python source (distinguishing source
+revisions beyond the version identifier), input SHA-256 fingerprints, model settings,
 and (for adaptive runs) the refinement attempts, convergence measurements and status.</p>
 
 <p>Outputs are staged and checked for SQLite integrity, layers, row counts, fields and CRS
