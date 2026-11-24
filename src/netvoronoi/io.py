@@ -262,8 +262,10 @@ def _publish(
        the only step that changes the target. On Windows it fails if another
        program has the target open; that error is raised, and the old file is
        kept. The old file is never deleted to make room;
-    5. in every case, remove the temporary file and any SQLite side files
-       of this temporary name. Files of the target are never removed.
+    5. attempt cleanup of the temporary file and any SQLite side files of
+       its temporary name. Cleanup failures after replacement are reported
+       distinctly; an earlier pre-replacement error takes precedence if
+       cleanup also fails. Files of the target are never removed.
     """
     target = check_output_path(path, overwrite=overwrite)
     _check_target_safe(target)
